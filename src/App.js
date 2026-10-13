@@ -54,39 +54,69 @@ function Dot({ on, warn }) {
 /* ------------------------------------------------------------------ */
 /* Settings                                                           */
 /* ------------------------------------------------------------------ */
+function ModelField({ label, hint, tier, onSave }) {
+  const [value, setValue] = useState(tier.model || '');
+  useEffect(() => { setValue(tier.model || ''); }, [tier.model]);
+  const id = `models-${label}`;
+  return (
+    <div>
+      <span className="mb-1 flex justify-between text-[#8b8f98]">
+        <span>{label} <span className="text-[#6d717a]">· {hint}</span></span>
+        <span className="font-mono text-[11px] text-[#6d717a]">{tier.provider === 'anthropic' ? 'Anthropic' : (tier.baseUrl || '').replace(/^https?:\/\//, '')}</span>
+      </span>
+      <input
+        list={id}
+        value={value}
+        placeholder="non impostato"
+        onChange={(e) => setValue(e.target.value)}
+        onBlur={() => value.trim() !== (tier.model || '') && onSave(value)}
+        onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur(); }}
+        className="w-full rounded-md border border-[#33363d] bg-[#25272c] px-2 py-1.5 font-mono text-[12px] outline-none focus:border-[#e8a33d]"
+      />
+      <datalist id={id}>
+        {(tier.presets || []).map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
+      </datalist>
+    </div>
+  );
+}
+
+const ROUTING_OPTIONS = [
+  { id: 'auto', label: 'Auto' },
+  { id: 'fast', label: 'Sempre veloce' },
+  { id: 'strong', label: 'Sempre esperto' },
+];
+
 function Settings({ status, onSaved }) {
   const [key, setKey] = useState('');
-  const [model, setModel] = useState('');
-  useEffect(() => { if (status && status.llm) setModel(status.llm.model || ''); }, [status && status.llm && status.llm.model]); // eslint-disable-line react-hooks/exhaustive-deps
   const save = async (patch) => {
     await fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) });
     onSaved();
   };
-  if (!status || status.offline || !status.llm) return null;
-  const { llm, separator } = status;
-  const inputCls = 'w-full rounded-md border border-[#33363d] bg-[#25272c] px-2 py-1.5 outline-none focus:border-[#e8a33d]';
+  if (!status || status.offline || !status.tiers) return null;
+  const { tiers, separator } = status;
   return (
     <div className="space-y-3 border-b border-[#2c2f35] bg-[#1c1e22] px-3 py-3 text-[12.5px]">
       <div>
-        <span className="mb-1 flex justify-between text-[#8b8f98]">
-          <span>Modello</span>
-          <span className="font-mono text-[11px] text-[#6d717a]">{llm.provider === 'anthropic' ? 'Anthropic' : (llm.baseUrl || '').replace(/^https?:\/\//, '')}</span>
-        </span>
-        <input
-          list="copilot-models"
-          value={model}
-          onChange={(e) => setModel(e.target.value)}
-          onBlur={() => model.trim() && model !== llm.model && save({ model })}
-          onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur(); }}
-          className={`${inputCls} font-mono text-[12px]`}
-        />
-        <datalist id="copilot-models">
-          {(llm.presets || []).map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
-        </datalist>
-        <span className="mt-1 block text-[11.5px] text-[#6d717a]">
-          Default dal .env: <span className="font-mono">{llm.envModel || '—'}</span>. Un cambio qui vale fino al riavvio del server.
+        <span className="mb-1 block text-[#8b8f98]">Scelta del modello</span>
+        <div className="grid grid-cols-3 gap-1 rounded-md bg-[#25272c] p-0.5">
+          {ROUTING_OPTIONS.map((o) => (
+            <button
+              key={o.id}
+              type="button"
+              onClick={() => save({ routing: o.id })}
+              className={`rounded px-1 py-1 text-[11.5px] ${status.routing === o.id ? 'bg-[#e8a33d] font-medium text-[#1a1407]' : 'text-[#a4a8b1] hover:text-[#f1f2f4]'}`}
+            >
+              {o.label}
+            </button>
+          ))}
+        </div>
+        <span className="mt-1 block text-[11.5px] leading-snug text-[#6d717a]">
+          Auto: i comandi semplici vanno al modello veloce, mix e analisi all'esperto. Se il veloce non ce la fa, passa la mano da solo.
         </span>
       </div>
+      <ModelField label="Veloce" hint="comandi semplici" tier={tiers.fast} onSave={(v) => save({ fastModel: v })} />
+      <ModelField label="Esperto" hint="mix e analisi" tier={tiers.strong} onSave={(v) => save({ strongModel: v })} />
+      <span className="-mt-1 block text-[11.5px] text-[#6d717a]">I modelli scelti qui valgono fino al riavvio; i default sono nel .env.</span>
       {!status.apiKeyFromEnv && (
         <div>
           <span className="mb-1 block text-[#8b8f98]">API key {status.hasApiKey && <span className="text-[#5fd38d]">· impostata</span>}</span>
@@ -96,7 +126,7 @@ function Settings({ status, onSaved }) {
               value={key}
               placeholder={status.hasApiKey ? '••••••••  (sostituisci)' : 'meglio LLM_API_KEY nel .env'}
               onChange={(e) => setKey(e.target.value)}
-              className={`${inputCls} min-w-0 flex-1`}
+              className="min-w-0 flex-1 rounded-md border border-[#33363d] bg-[#25272c] px-2 py-1.5 outline-none focus:border-[#e8a33d]"
             />
             <button
               type="button"
@@ -267,6 +297,10 @@ function ToolRow({ part }) {
   );
 }
 
+function formatTokens(n) {
+  return n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : String(n);
+}
+
 function AssistantTurn({ turn, running }) {
   const groups = [];
   for (const p of turn.parts) {
@@ -286,8 +320,22 @@ function AssistantTurn({ turn, running }) {
           );
         }
         if (g.kind === 'error') return <div key={i} className="rounded-md border border-[#5a2a28] bg-[#2a1b1a] px-2.5 py-2 text-[#f0a09b]">{g.text}</div>;
+        if (g.kind === 'model') {
+          const fast = g.tier === 'fast';
+          return (
+            <div key={i} className="flex items-center gap-1.5 font-mono text-[10.5px] text-[#6d717a]" title={g.reason}>
+              <span className={fast ? 'text-[#7fb7e8]' : 'text-[#e8a33d]'}>{fast ? '⚡ veloce' : (i > 0 ? '↑ esperto' : '★ esperto')}</span>
+              <span className="truncate">{String(g.model || '').replace(/^claude-/, '')}{i > 0 && g.reason ? ` · ${g.reason}` : ''}</span>
+            </div>
+          );
+        }
         return <Markdown key={i} text={g.text} />;
       })}
+      {!running && turn.usage && turn.usage.in + turn.usage.out > 0 && (
+        <div className="font-mono text-[10.5px] text-[#5f636b]">
+          {formatTokens(turn.usage.in + turn.usage.out)} token{turn.usage.cost != null ? ` · ~$${turn.usage.cost < 0.01 ? turn.usage.cost.toFixed(4) : turn.usage.cost.toFixed(3)}` : ''}
+        </div>
+      )}
       {running && (
         <div className="flex items-end gap-[3px] py-1 pl-0.5" aria-label="sto lavorando">
           <span className="meter-dot h-2 w-[3px] rounded-sm bg-[#e8a33d]" />
@@ -338,6 +386,17 @@ export default function App() {
     else if (ev.type === 'tool_call') updateLast((ps) => [...ps, { kind: 'tool', id: ev.id, name: ev.name, input: ev.input, status: 'running' }]);
     else if (ev.type === 'tool_result') updateLast((ps) => ps.map((p) => (p.id === ev.id ? { ...p, status: ev.ok ? 'ok' : 'error', preview: ev.preview } : p)));
     else if (ev.type === 'error') updateLast((ps) => [...ps, { kind: 'error', text: ev.error }]);
+    else if (ev.type === 'model') updateLast((ps) => [...ps, { kind: 'model', tier: ev.tier, model: ev.model, reason: ev.reason }]);
+    else if (ev.type === 'usage') {
+      setTurns((ts) => {
+        const copy = ts.slice();
+        const last = { ...copy[copy.length - 1] };
+        const u = last.usage || { in: 0, out: 0, cost: null };
+        last.usage = { in: u.in + (ev.in || 0), out: u.out + (ev.out || 0), cost: ev.cost != null ? (u.cost || 0) + ev.cost : u.cost };
+        copy[copy.length - 1] = last;
+        return copy;
+      });
+    }
     else if (ev.type === 'done' && ev.aborted) updateLast((ps) => [...ps, { kind: 'text', text: '_Interrotto._' }]);
   };
 
@@ -406,7 +465,9 @@ export default function App() {
   };
 
   const reaperOk = status && status.reaper && status.reaper.connected;
-  const modelLabel = status && status.llm ? String(status.llm.model || '').replace(/^claude-/, '').replace(/^.*\//, '') : '';
+  const modelLabel = status && status.tiers
+    ? (status.routing === 'auto' ? 'auto' : String(status.tiers[status.routing].model || '').replace(/^claude-/, '').replace(/^.*\//, ''))
+    : '';
 
   return (
     <div className="flex h-full min-w-[300px] flex-col">

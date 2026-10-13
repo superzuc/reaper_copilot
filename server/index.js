@@ -10,6 +10,7 @@ const references = require('./references');
 const agent = require('./agent');
 const audio = require('./audio');
 const separation = require('./separation');
+const usage = require('./usage');
 
 const app = express();
 app.use(express.json({ limit: '2mb' }));
@@ -20,7 +21,7 @@ const upload = multer({ dest: path.join(os.tmpdir(), 'reaper-copilot-uploads'), 
 const sessions = new Map();
 const running = new Map();
 function getSession(id) {
-  if (!sessions.has(id)) sessions.set(id, { messages: [] });
+  if (!sessions.has(id)) sessions.set(id, { id, messages: [] });
   return sessions.get(id);
 }
 
@@ -39,15 +40,20 @@ function checkFfmpeg() {
 app.get('/api/status', async (req, res) => {
   res.json({
     reaper: reaper.status(),
-    llm: {
-      provider: config.llm.provider,
-      baseUrl: config.llm.provider === 'openai' ? config.llm.baseUrl : undefined,
-      model: config.model(),
-      envModel: config.llm.envModel,
-      presets: config.llm.presets,
-    },
-    hasApiKey: Boolean(config.apiKey()) || !config.keyRequired(),
-    apiKeyFromEnv: Boolean(config.apiKeyFromEnv()) || !config.keyRequired(),
+    tiers: Object.fromEntries(Object.entries(config.tiers).map(([name, t]) => [name, {
+      provider: t.provider,
+      baseUrl: t.provider === 'openai' ? t.baseUrl : undefined,
+      model: config.tierModel(t),
+      envModel: t.envModel,
+      presets: t.presets,
+      priced: Boolean(t.price),
+      hasKey: Boolean(config.tierKey(t)) || !config.keyRequired(t),
+      keyFromEnv: Boolean(t.envKey) || !config.keyRequired(t),
+    }])),
+    routing: config.routingMode(),
+    routingEnv: config.routing.mode,
+    hasApiKey: Boolean(config.tierKey(config.tiers.strong)) || !config.keyRequired(config.tiers.strong),
+    apiKeyFromEnv: Boolean(config.tiers.strong.envKey) || !config.keyRequired(config.tiers.strong),
     allowLua: Boolean(config.settings.allowLua),
     ffmpeg: checkFfmpeg(),
     separator: await separation.status(),
@@ -61,7 +67,14 @@ app.post('/api/settings', (req, res) => {
   if (typeof req.body.apiKey === 'string') patch.apiKey = req.body.apiKey.trim();
   if (Object.keys(patch).length) config.saveSettings(patch);
   // il modello scelto dalla UI vale fino al riavvio; il default resta LLM_MODEL nel .env
-  if (typeof req.body.model === 'string') config.llm.runtimeModel = req.body.model.trim() === config.llm.envModel ? '' : req.body.model.trim();
+  for (const name of ['strong', 'fast']) {
+    const v = req.body[`${name}Model`];
+    if (typeof v === 'string') {
+      const t = config.tiers[name];
+      t.runtimeModel = v.trim() === t.envModel ? '' : v.trim();
+    }
+  }
+  if (['auto', 'strong', 'fast'].includes(req.body.routing)) config.routing.runtimeMode = req.body.routing === config.routing.mode ? '' : req.body.routing;
   res.json({ ok: true });
 });
 
@@ -91,6 +104,8 @@ app.post('/api/chat', async (req, res) => {
     res.end();
   }
 });
+
+app.get('/api/usage', (req, res) => res.json(usage.summary(Number(req.query.days) || 30)));
 
 app.post('/api/chat/stop', (req, res) => {
   const c = running.get((req.body && req.body.sessionId) || 'default');
@@ -141,7 +156,10 @@ if (fs.existsSync(buildDir)) {
 app.listen(config.port, '127.0.0.1', () => {
   console.log(`[copilot] server su http://localhost:${config.port}`);
   console.log(`[copilot] cartella IPC: ${config.ipcDir}`);
-  console.log(`[copilot] modello: ${config.llm.provider} · ${config.model() || '(manca LLM_MODEL)'}${config.llm.provider === 'openai' ? ` · ${config.llm.baseUrl}` : ''}`);
+  for (const [name, t] of Object.entries(config.tiers)) {
+    console.log(`[copilot] modello ${name === 'strong' ? 'forte ' : 'veloce'}: ${t.provider} · ${config.tierModel(t) || '(non impostato)'}${t.provider === 'openai' ? ` · ${t.baseUrl}` : ''}`);
+  }
+  console.log(`[copilot] routing: ${config.routingMode()}`);
   console.log(`[copilot] separazione stem: ${config.separator.mode} (${config.separator.model})`);
   separation.init();
   const st = reaper.status();

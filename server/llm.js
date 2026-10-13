@@ -4,6 +4,7 @@ const sdk = require('@anthropic-ai/sdk');
 const config = require('./config');
 
 const Anthropic = sdk.default || sdk;
+const MAX_TOKENS = Number(process.env.LLM_MAX_TOKENS || 8192);
 
 // ---------------------------------------------------------------------------
 // Anthropic
@@ -18,14 +19,14 @@ function withCacheBreakpoint(messages) {
   return out;
 }
 
-async function anthropicComplete({ system, tools, messages, signal }) {
-  const opts = { apiKey: config.apiKey() };
-  if (config.llm.baseUrl) opts.baseURL = config.llm.baseUrl;
+async function anthropicComplete({ tier, system, tools, messages, signal }) {
+  const opts = { apiKey: config.tierKey(tier) };
+  if (tier.baseUrl) opts.baseURL = tier.baseUrl;
   const client = new Anthropic(opts);
   const cachedTools = tools.map((t, i) => (i === tools.length - 1 ? { ...t, cache_control: { type: 'ephemeral' } } : t));
   const resp = await client.messages.create({
-    model: config.model(),
-    max_tokens: config.llm.maxTokens,
+    model: config.tierModel(tier),
+    max_tokens: MAX_TOKENS,
     system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
     tools: cachedTools,
     messages: withCacheBreakpoint(messages),
@@ -80,23 +81,23 @@ function toOpenAIMessages(system, messages) {
   return out;
 }
 
-async function openaiComplete({ system, tools, messages, signal }) {
+async function openaiComplete({ tier, system, tools, messages, signal }) {
   const headers = { 'Content-Type': 'application/json' };
-  const key = config.apiKey();
+  const key = config.tierKey(tier);
   if (key) headers.Authorization = `Bearer ${key}`;
-  if (/openrouter\.ai/.test(config.llm.baseUrl)) {
+  if (/openrouter\.ai/.test(tier.baseUrl)) {
     headers['HTTP-Referer'] = 'http://localhost';
     headers['X-Title'] = 'REAPER Copilot';
   }
   const body = {
-    model: config.model(),
+    model: config.tierModel(tier),
     messages: toOpenAIMessages(system, messages),
     tools: tools.map((t) => ({ type: 'function', function: { name: t.name, description: t.description, parameters: simplifySchema(t.input_schema) } })),
     tool_choice: 'auto',
   };
-  if (process.env.LLM_MAX_TOKENS) body.max_tokens = config.llm.maxTokens;
+  if (process.env.LLM_MAX_TOKENS) body.max_tokens = MAX_TOKENS;
 
-  const res = await fetch(`${config.llm.baseUrl}/chat/completions`, { method: 'POST', headers, body: JSON.stringify(body), signal });
+  const res = await fetch(`${tier.baseUrl}/chat/completions`, { method: 'POST', headers, body: JSON.stringify(body), signal });
   const raw = await res.text();
   if (!res.ok) throw new Error(`API ${res.status}: ${raw.slice(0, 500)}`);
   let data;
@@ -110,23 +111,29 @@ async function openaiComplete({ system, tools, messages, signal }) {
   for (const c of msg.tool_calls || []) {
     let input = {};
     try { input = c.function.arguments ? JSON.parse(c.function.arguments) : {}; } catch (_) { input = { _raw: c.function.arguments }; }
-    content.push({ type: 'tool_use', id: c.id || `call_${Math.random().toString(36).slice(2)}`, name: c.function.name, input });
+    const id = String(c.id || `call_${Math.random().toString(36).slice(2)}`).replace(/[^a-zA-Z0-9_-]/g, '_');
+    content.push({ type: 'tool_use', id, name: c.function.name, input });
   }
   const hasTools = content.some((b) => b.type === 'tool_use');
   const u = data.usage || {};
   return {
     content,
     stop_reason: hasTools ? 'tool_use' : 'end_turn',
-    usage: { input_tokens: u.prompt_tokens, output_tokens: u.completion_tokens },
+    usage: {
+      input_tokens: u.prompt_tokens || 0,
+      output_tokens: u.completion_tokens || 0,
+      cache_read_input_tokens: (u.prompt_tokens_details && u.prompt_tokens_details.cached_tokens) || 0,
+    },
   };
 }
 
 async function complete(args) {
-  if (config.keyRequired() && !config.apiKey()) {
-    throw new Error('Manca la API key: imposta LLM_API_KEY nel file .env (o dalla UI).');
+  const { tier } = args;
+  if (config.keyRequired(tier) && !config.tierKey(tier)) {
+    throw new Error('Manca la API key: imposta LLM_API_KEY (e LLM_FAST_API_KEY se usi un altro provider) nel file .env.');
   }
-  if (!config.model()) throw new Error('Manca il nome del modello: imposta LLM_MODEL nel file .env.');
-  return config.llm.provider === 'anthropic' ? anthropicComplete(args) : openaiComplete(args);
+  if (!config.tierModel(tier)) throw new Error('Manca il nome del modello: imposta LLM_MODEL nel file .env.');
+  return tier.provider === 'anthropic' ? anthropicComplete(args) : openaiComplete(args);
 }
 
 module.exports = { complete, toOpenAIMessages, simplifySchema };

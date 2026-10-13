@@ -6,6 +6,7 @@ const llm = require('./llm');
 const reaper = require('./reaper');
 const audio = require('./audio');
 const references = require('./references');
+const usage = require('./usage');
 
 const MAX_STEPS = Number(process.env.MAX_AGENT_STEPS || 60);
 
@@ -282,26 +283,99 @@ function preview(obj) {
   return s.length > 400 ? s.slice(0, 400) + '…' : s;
 }
 
+// ---------------------------------------------------------------------------
+// Routing: modello veloce per i comandi semplici, forte per mix/analisi
+// ---------------------------------------------------------------------------
+const FAST_SYSTEM = `You are REAPER Copilot in QUICK MODE: a fast assistant for simple, direct edits in the user's REAPER project. Reply in the user's language, very briefly.
+
+Handle yourself only clear, mechanical requests: change volume/pan/mute/solo/names, create or delete a track the user asked for, add/remove/bypass a plugin, set a parameter to a value the user gave or an obvious standard value, add a send, undo, answer a quick question about the project.
+Rules: call get_project first; never guess indices; after add_fx call get_fx_params and set values with "display" in real units (Hz, dB, ms); every change is undoable.
+
+Call escalate IMMEDIATELY (as your only tool call, before anything else) when the request needs listening/measuring, renders or analysis, reference tracks or stems, "make it sound like…", mixing or mastering decisions, choosing EQ/compression settings by ear, multi-track creative work, or whenever you are unsure. Escalating is cheap; doing it badly is not.`;
+
+const ESCALATE_TOOL = {
+  name: 'escalate',
+  description: 'Passa la richiesta al modello esperto di mix (per analisi, reference, mix/mastering, decisioni sonore o quando non sei sicuro).',
+  input_schema: { type: 'object', properties: { reason: { type: 'string' } } },
+};
+
+const ANALYSIS_TOOLS = new Set(['render_and_analyze', 'separate_reference', 'analyze_reference']);
+const FAST_MAX_STEPS = Number(process.env.FAST_MAX_STEPS || 8);
+const STRONG_HINT = /\b(mix\w*|miss\w*|master\w*|reference|referenc\w*|riferiment\w*|analizz\w*|analisi|confront\w*|lufs|loudness|render\w*|stile|match\w*|bilanc\w*|equilibr\w*|catena|chain|sound\w*|suon\w*|timbr\w*|caldo|brillant\w*|corpo|pulit\w*|impastat\w*|fango\w*|profession\w*)\b|\bcome (i|il|la|lo|le|gli|quell\w*|nei|nel|nella) /i;
+
+function pickTier(session, text) {
+  const mode = config.routingMode();
+  if (mode === 'strong' || mode === 'fast') return mode;
+  if (/^\s*(continua|vai avanti|prosegui|riprova|go on|continue)\b/i.test(text) && session.lastTier) return session.lastTier;
+  return STRONG_HINT.test(text) ? 'strong' : 'fast';
+}
+
 async function run(session, userText, emit, signal) {
   session.messages.push({ role: 'user', content: userText });
+  let tierName = pickTier(session, userText);
+  let fastSteps = 0;
+  let errorStreak = 0;
+
+  const announce = (reason) => {
+    const tier = config.tiers[tierName];
+    emit({ type: 'model', tier: tierName, model: config.tierModel(tier), reason });
+  };
+  announce(tierName === 'strong' ? 'richiesta di mix/analisi' : 'comando semplice');
+
+  const escalate = (reason) => {
+    tierName = 'strong';
+    announce(reason);
+  };
 
   for (let step = 0; step < MAX_STEPS; step++) {
     if (signal.aborted) break;
-    const resp = await llm.complete({ system: SYSTEM, tools: tools(), messages: compactHistory(session.messages), signal });
+    const tier = config.tiers[tierName];
+    const isFast = tierName === 'fast';
+    const resp = await llm.complete({
+      tier,
+      system: isFast ? FAST_SYSTEM : SYSTEM,
+      tools: isFast ? [...tools(), ESCALATE_TOOL] : tools(),
+      messages: compactHistory(session.messages),
+      signal,
+    });
+
+    if (resp.usage) {
+      const row = usage.record({ sessionId: session.id, tierName, tier, model: config.tierModel(tier), usage: resp.usage });
+      emit({ type: 'usage', tier: tierName, model: row.model, in: row.in, out: row.out, cache_read: row.cache_read, cost: row.cost });
+    }
+
+    // il modello veloce chiede aiuto, o prova a fare analisi: passo al forte senza
+    // tenere la sua risposta (la cronologia resta pulita)
+    if (isFast) {
+      const uses = resp.content.filter((b) => b.type === 'tool_use');
+      const esc = uses.find((b) => b.name === 'escalate');
+      const analysis = uses.find((b) => ANALYSIS_TOOLS.has(b.name));
+      if (esc || analysis) {
+        escalate(esc ? (esc.input && esc.input.reason) || 'serve il modello esperto' : 'serve un\'analisi audio');
+        continue;
+      }
+    }
 
     session.messages.push({ role: 'assistant', content: resp.content });
     for (const block of resp.content) {
       if (block.type === 'text' && block.text.trim()) emit({ type: 'text', text: block.text });
       if (block.type === 'tool_use') emit({ type: 'tool_call', id: block.id, name: block.name, input: block.input });
     }
-    if (resp.usage) emit({ type: 'usage', usage: resp.usage });
-    if (resp.stop_reason !== 'tool_use') return;
+    if (resp.stop_reason !== 'tool_use') {
+      session.lastTier = tierName;
+      return;
+    }
 
     const results = [];
+    let errors = 0;
     for (const block of resp.content) {
       if (block.type !== 'tool_use') continue;
       if (signal.aborted) {
         results.push({ type: 'tool_result', tool_use_id: block.id, content: 'Interrotto dall\'utente', is_error: true });
+        continue;
+      }
+      if (block.name === 'escalate') {
+        results.push({ type: 'tool_result', tool_use_id: block.id, content: 'Sei già il modello esperto: continua tu.' });
         continue;
       }
       try {
@@ -310,13 +384,22 @@ async function run(session, userText, emit, signal) {
         results.push({ type: 'tool_result', tool_use_id: block.id, content: text.length > 40000 ? text.slice(0, 40000) + '…' : text });
         emit({ type: 'tool_result', id: block.id, ok: true, preview: preview(out ?? 'ok') });
       } catch (e) {
+        errors++;
         results.push({ type: 'tool_result', tool_use_id: block.id, content: 'Errore: ' + e.message, is_error: true });
         emit({ type: 'tool_result', id: block.id, ok: false, preview: e.message });
       }
     }
     session.messages.push({ role: 'user', content: results });
+
+    if (isFast) {
+      fastSteps++;
+      errorStreak = errors > 0 ? errorStreak + 1 : 0;
+      if (errorStreak >= 2) escalate('il modello veloce ha sbagliato due volte di fila');
+      else if (fastSteps >= FAST_MAX_STEPS) escalate('la richiesta è più lunga del previsto');
+    }
   }
+  session.lastTier = tierName;
   if (!signal.aborted) emit({ type: 'text', text: '_(Mi fermo qui: raggiunto il numero massimo di passaggi per una richiesta. Scrivimi "continua" se vuoi che vada avanti.)_' });
 }
 
-module.exports = { run, TOOLS, SYSTEM };
+module.exports = { run, TOOLS, SYSTEM, FAST_SYSTEM, pickTier };

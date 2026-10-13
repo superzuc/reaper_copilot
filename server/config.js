@@ -11,27 +11,50 @@ fs.mkdirSync(dataDir, { recursive: true });
 const settingsFile = path.join(dataDir, 'settings.json');
 
 // ---------------------------------------------------------------------------
-// LLM: tutto configurabile da .env
-//   LLM_PROVIDER = anthropic | openai   (openai = qualsiasi API compatibile OpenAI:
-//                  OpenAI, OpenRouter, Gemini, DeepSeek, Groq, Ollama in locale…)
-//   LLM_API_KEY, LLM_MODEL, LLM_BASE_URL, LLM_MAX_TOKENS
+// LLM a due livelli, tutto da .env
+//   forte  (mix, analisi, reference): LLM_PROVIDER, LLM_API_KEY, LLM_MODEL, LLM_BASE_URL
+//   veloce (comandi semplici):        LLM_FAST_PROVIDER, LLM_FAST_API_KEY, LLM_FAST_MODEL, LLM_FAST_BASE_URL
+//   (i LLM_FAST_* non impostati ereditano dal modello forte, tranne il nome del modello)
+//   ROUTING = auto | strong | fast
+//   provider: anthropic | openai (= qualsiasi API compatibile OpenAI: OpenRouter, OpenAI,
+//   Gemini, DeepSeek, Groq, Ollama…)
 // ---------------------------------------------------------------------------
-const provider = (env.LLM_PROVIDER || (env.LLM_BASE_URL ? 'openai' : 'anthropic')).toLowerCase();
+const ANTHROPIC_PRESETS = [
+  { id: 'claude-opus-5-5', label: 'Opus 5.5 (il migliore, costoso)' },
+  { id: 'claude-sonnet-5-5', label: 'Sonnet 5.5 (equilibrato)' },
+  { id: 'claude-haiku-5-5', label: 'Haiku 5.5 (economico)' },
+];
 
-const llm = {
-  provider,
-  baseUrl: (env.LLM_BASE_URL || (provider === 'openai' ? 'https://api.openai.com/v1' : '')).replace(/\/+$/, ''),
-  envModel: env.LLM_MODEL || env.ANTHROPIC_MODEL || (provider === 'anthropic' ? 'claude-sonnet-5-5' : ''),
-  maxTokens: Number(env.LLM_MAX_TOKENS || 8192),
-  presets: provider === 'anthropic'
-    ? [
-      { id: 'claude-opus-5-5', label: 'Opus 5.5 (il migliore, costoso)' },
-      { id: 'claude-sonnet-5-5', label: 'Sonnet 5.5 (equilibrato)' },
-      { id: 'claude-haiku-5-5', label: 'Haiku 5.5 (economico)' },
-    ]
-    : [],
-  runtimeModel: '', // override dalla UI, vale fino al riavvio
-};
+function parsePrice(v) {
+  if (!v) return null;
+  const [inp, out] = String(v).split(/[,;/ ]+/).map(Number);
+  return Number.isFinite(inp) && Number.isFinite(out) ? { input: inp, output: out } : null;
+}
+
+function makeTier(prefix, fallback) {
+  const get = (k) => env[`${prefix}${k}`];
+  const baseUrlRaw = get('BASE_URL') || (fallback && !get('PROVIDER') ? fallback.baseUrlRaw : '');
+  const provider = (get('PROVIDER') || (get('BASE_URL') ? 'openai' : fallback ? fallback.provider : 'anthropic')).toLowerCase();
+  const tier = {
+    provider,
+    baseUrlRaw,
+    baseUrl: (baseUrlRaw || (provider === 'openai' ? 'https://api.openai.com/v1' : '')).replace(/\/+$/, ''),
+    envKey: get('API_KEY') || (fallback && fallback.provider === provider ? fallback.envKey : '') ||
+      (provider === 'anthropic' ? env.ANTHROPIC_API_KEY : env.OPENAI_API_KEY) || '',
+    envModel: get('MODEL') || '',
+    price: parsePrice(get('PRICE_PER_MTOK')),
+    runtimeModel: '',
+  };
+  tier.presets = provider === 'anthropic' ? ANTHROPIC_PRESETS : [];
+  return tier;
+}
+
+const strong = makeTier('LLM_', null);
+if (!strong.envModel) strong.envModel = env.ANTHROPIC_MODEL || (strong.provider === 'anthropic' ? 'claude-sonnet-5-5' : '');
+const fast = makeTier('LLM_FAST_', strong);
+if (!fast.envModel && fast.provider === 'anthropic') fast.envModel = 'claude-haiku-5-5';
+const tiers = { strong, fast };
+const routing = { mode: (env.ROUTING || 'auto').toLowerCase(), runtimeMode: '' };
 
 // ---------------------------------------------------------------------------
 // Separazione stem
@@ -66,21 +89,23 @@ function saveSettings(patch) {
   fs.writeFileSync(settingsFile, JSON.stringify(settings, null, 2));
 }
 
-function apiKeyFromEnv() {
-  return env.LLM_API_KEY || (provider === 'anthropic' ? env.ANTHROPIC_API_KEY : env.OPENAI_API_KEY) || '';
+function tierModel(t) {
+  return t.runtimeModel || t.envModel;
 }
 
-function apiKey() {
-  return apiKeyFromEnv() || settings.apiKey || '';
+function tierKey(t) {
+  return t.envKey || settings.apiKey || '';
 }
 
-function model() {
-  return llm.runtimeModel || llm.envModel;
-}
-
-function keyRequired() {
+function keyRequired(t) {
   // Ollama / LM Studio in locale non vogliono chiavi
-  return !(provider === 'openai' && /localhost|127\.0\.0\.1/.test(llm.baseUrl));
+  return !(t.provider === 'openai' && /localhost|127\.0\.0\.1/.test(t.baseUrl));
+}
+
+function routingMode() {
+  const m = routing.runtimeMode || routing.mode;
+  if (m === 'auto' && !tierModel(fast)) return 'strong';
+  return m;
 }
 
 module.exports = {
@@ -92,12 +117,13 @@ module.exports = {
   referencesDir: path.join(dataDir, 'references'),
   stemsDir: path.join(dataDir, 'stems'),
   analyzerDir: path.join(root, 'analyzer'),
-  llm,
+  tiers,
+  routing,
+  routingMode,
   separator,
   settings,
   saveSettings,
-  apiKey,
-  apiKeyFromEnv,
+  tierModel,
+  tierKey,
   keyRequired,
-  model,
 };

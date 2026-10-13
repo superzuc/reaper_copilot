@@ -32,19 +32,20 @@ npm run window     # apre la UI in una finestra stretta da mettere a destra di R
 
 Trascina i brani di riferimento nel pannello **Reference**: vengono analizzati e separati in stem in automatico (su CPU qualche minuto a brano, una volta sola). Poi chiedi di usarli per nome.
 
-## Cambiare modello
+## Modelli: veloce + esperto
 
-Tutto nel `.env`, poi riavvia `npm start`:
+Il copilot usa due modelli, configurati nel `.env` (dettagli ed esempi in `.env.example`):
 
-| Cosa | Variabili |
-|---|---|
-| Claude | `LLM_PROVIDER=anthropic`, `LLM_MODEL=claude-sonnet-5-5` (oppure `claude-opus-5-5`, `claude-haiku-5-5`) |
-| OpenRouter, OpenAI, Gemini, DeepSeek… | `LLM_PROVIDER=openai`, `LLM_BASE_URL=…`, `LLM_MODEL=…` |
-| Ollama in locale | `LLM_PROVIDER=openai`, `LLM_BASE_URL=http://localhost:11434/v1`, nessuna key |
+- **Veloce** (`LLM_FAST_*`, default `claude-haiku-5-5`): comandi semplici come "abbassa la batteria", "metti un compressore sul basso".
+- **Esperto** (`LLM_*`, default `claude-sonnet-5-5`): mix, mastering, analisi, reference, "fallo suonare come…".
 
-Gli indirizzi pronti sono in `.env.example`. Dalla UI (clic sul nome del modello in alto) puoi cambiare modello al volo: vale fino al riavvio.
+Con `ROUTING=auto` la scelta è automatica: le richieste di mix/analisi vanno subito all'esperto, il resto al veloce. Il veloce passa la mano all'esperto (con un tool `escalate`) se la richiesta è più complessa del previsto, se prova a fare un'analisi, se sbaglia due volte di fila o se supera `FAST_MAX_STEPS` passaggi. Nella chat vedi quale modello ha risposto e quanti token ha consumato.
 
-Nota: il lavoro richiede tante chiamate ai tool in fila; i modelli piccoli o locali tendono a perdersi a metà. Per i lavori lunghi ("mixa come…") usa un modello forte, per i comandi semplici va bene uno economico.
+I due livelli possono stare su provider diversi (es. veloce su Gemini, esperto su Claude). Provider supportati: Anthropic e qualsiasi API compatibile OpenAI (OpenRouter, OpenAI, Gemini, DeepSeek, Ollama in locale…).
+
+**Costi**: ogni chiamata viene registrata in `data/usage.jsonl` (token, modello, livello). Se nel `.env` metti i prezzi (`LLM_PRICE_PER_MTOK`, `LLM_FAST_PRICE_PER_MTOK`), la chat mostra anche il costo stimato per risposta e `GET /api/usage` dà i totali per modello e per giorno: utile per decidere il prezzo dell'abbonamento.
+
+Dalla UI (clic su "auto" in alto) puoi forzare sempre veloce / sempre esperto o cambiare modello al volo; vale fino al riavvio.
 
 ## Separazione stem: dove gira
 
