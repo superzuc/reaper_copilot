@@ -10,18 +10,27 @@
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
     "react-scripts": "5.0.1",
-    "web-vitals": "^2.1.4"
+    "web-vitals": "^2.1.4",
+    "@anthropic-ai/sdk": "^0.133.0",
+    "express": "^5.2.0",
+    "multer": "^2.0.2",
+    "dotenv": "^17.2.0",
+    "ffmpeg-static": "^5.2.0"
   },
   "scripts": {
-    "start": "react-scripts start",
+    "start": "concurrently -k -n server,ui -c magenta,cyan \"npm:server\" \"npm:ui\"",
+    "ui": "react-scripts start",
+    "server": "node server/index.js",
+    "app": "npm run build && npm run server",
+    "window": "node scripts/open-window.js",
     "build": "react-scripts build",
     "test": "react-scripts test",
-    "eject": "react-scripts eject"
+    "analyzer:setup": "node scripts/setup-analyzer.js",
+    "analyzer:setup:gpu": "node scripts/setup-analyzer.js --gpu"
   },
   "eslintConfig": {
     "extends": [
-      "react-app",
-      "react-app/jest"
+      "react-app"
     ]
   },
   "browserslist": {
@@ -35,5 +44,10 @@
       "last 1 firefox version",
       "last 1 safari version"
     ]
-  }
+  },
+  "devDependencies": {
+    "tailwindcss": "^3.4.19",
+    "concurrently": "^9.2.0"
+  },
+  "proxy": "http://localhost:3001"
 }

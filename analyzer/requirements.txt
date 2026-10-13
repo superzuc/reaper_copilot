@@ -1,0 +1,5 @@
+# Separazione stem (Demucs / RoFormer / MDX) + analisi
+# Su Windows senza GPU va bene così (torch CPU). Con GPU NVIDIA: sostituisci [cpu] con [gpu]
+audio-separator[cpu]>=0.47
+audioread>=3.0
+librosa>=0.10

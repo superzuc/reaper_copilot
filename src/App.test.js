@@ -1,8 +1,11 @@
 import { render, screen } from '@testing-library/react';
 import App from './App';
 
-test('renders learn react link', () => {
+beforeEach(() => {
+  global.fetch = jest.fn(() => Promise.resolve({ json: () => Promise.resolve([]) }));
+});
+
+test('mostra il pannello del copilot', () => {
   render(<App />);
-  const linkElement = screen.getByText(/learn react/i);
-  expect(linkElement).toBeInTheDocument();
+  expect(screen.getByText('Cosa facciamo al mix?')).toBeInTheDocument();
 });

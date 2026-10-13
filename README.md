@@ -1,70 +1,65 @@
-# Getting Started with Create React App
+# REAPER Copilot
 
-This project was bootstrapped with [Create React App](https://github.com/facebook/create-react-app).
+Una chat da tenere a destra di REAPER: scrivi cosa vuoi ("mixa come questa traccia dei Queen", "dai al basso il suono dei Ramones", "master a -14 LUFS") e il modello modifica il progetto con i plugin, poi renderizza, misura e corregge.
 
-## Available Scripts
+## Come funziona
 
-In the project directory, you can run:
+```
+UI React (chat) ──▶ server Node (agente + analisi audio) ──file JSON──▶ script Lua dentro REAPER
+                              │
+                              └──▶ servizio Python: separazione stem (Demucs/RoFormer) + analisi musicale
+                                   (sul PC, su una macchina con GPU, o su Google Colab via Drive)
+```
 
-### `npm start`
+- **`reaper/reaper_copilot_bridge.lua`**: ReaScript che resta attivo in REAPER ed esegue i comandi (tracce, volumi, pan, FX, parametri, send, render). Ogni comando è un punto di undo.
+- **`server/`**: fa girare il modello con i tool, renderizza e analizza (LUFS, LRA, picchi, crest, bilanciamento tonale a 1/3 d'ottava, stereo), confronta con le reference. `llm.js` parla con Anthropic o con qualsiasi API compatibile OpenAI.
+- **`analyzer/`**: separa le reference in stem (voce, batteria, basso, chitarra, piano, altro) e ne estrae tempo, tonalità, transienti, dinamica, brillantezza. Così il modello confronta il *tuo* basso con il *basso* della reference, non con una banda del mix.
+- **`src/`**: la chat, pensata per una finestra stretta (~420 px).
 
-Runs the app in the development mode.\
-Open [http://localhost:3000](http://localhost:3000) to view it in your browser.
+## Setup (una volta)
 
-The page will reload when you make changes.\
-You may also see any lint errors in the console.
+1. `npm install`
+2. `copy .env.example .env` e compila almeno `LLM_API_KEY` e `LLM_MODEL` (vedi sotto).
+3. `npm run analyzer:setup` → crea `analyzer/.venv`, installa le librerie Python e scarica il modello di separazione (qualche GB tra torch e modelli, ci mette un po').
+4. In REAPER: **Actions → Show action list → New action → Load ReaScript…** → `reaper/reaper_copilot_bridge.lua`, e avvialo (puoi metterlo su un pulsante della toolbar).
 
-### `npm test`
+## Uso
 
-Launches the test runner in the interactive watch mode.\
-See the section about [running tests](https://facebook.github.io/create-react-app/docs/running-tests) for more information.
+```bash
+npm start          # server (3001) + UI (3000); avvia da solo anche il servizio Python
+npm run window     # apre la UI in una finestra stretta da mettere a destra di REAPER
+```
 
-### `npm run build`
+Trascina i brani di riferimento nel pannello **Reference**: vengono analizzati e separati in stem in automatico (su CPU qualche minuto a brano, una volta sola). Poi chiedi di usarli per nome.
 
-Builds the app for production to the `build` folder.\
-It correctly bundles React in production mode and optimizes the build for the best performance.
+## Cambiare modello
 
-The build is minified and the filenames include the hashes.\
-Your app is ready to be deployed!
+Tutto nel `.env`, poi riavvia `npm start`:
 
-See the section about [deployment](https://facebook.github.io/create-react-app/docs/deployment) for more information.
+| Cosa | Variabili |
+|---|---|
+| Claude | `LLM_PROVIDER=anthropic`, `LLM_MODEL=claude-sonnet-5-5` (oppure `claude-opus-5-5`, `claude-haiku-5-5`) |
+| OpenRouter, OpenAI, Gemini, DeepSeek… | `LLM_PROVIDER=openai`, `LLM_BASE_URL=…`, `LLM_MODEL=…` |
+| Ollama in locale | `LLM_PROVIDER=openai`, `LLM_BASE_URL=http://localhost:11434/v1`, nessuna key |
 
-### `npm run eject`
+Gli indirizzi pronti sono in `.env.example`. Dalla UI (clic sul nome del modello in alto) puoi cambiare modello al volo: vale fino al riavvio.
 
-**Note: this is a one-way operation. Once you `eject`, you can't go back!**
+Nota: il lavoro richiede tante chiamate ai tool in fila; i modelli piccoli o locali tendono a perdersi a metà. Per i lavori lunghi ("mixa come…") usa un modello forte, per i comandi semplici va bene uno economico.
 
-If you aren't satisfied with the build tool and configuration choices, you can `eject` at any time. This command will remove the single build dependency from your project.
+## Separazione stem: dove gira
 
-Instead, it will copy all the configuration files and the transitive dependencies (webpack, Babel, ESLint, etc) right into your project so you have full control over them. All of the commands except `eject` will still work, but they will point to the copied scripts so you can tweak them. At this point you're on your own.
+`SEPARATOR` nel `.env`:
 
-You don't have to ever use `eject`. The curated feature set is suitable for small and middle deployments, and you shouldn't feel obligated to use this feature. However we understand that this tool wouldn't be useful if you couldn't customize it when you are ready for it.
+- **`local`** (default): sul tuo PC, CPU. Basta `npm run analyzer:setup`.
+- **`remote`**: su un'altra macchina con GPU (un PC, RunPod, ecc.). Lì: `python analyzer/service.py --host 0.0.0.0` con `ANALYZER_TOKEN=…`; qui: `SEPARATOR_URL=http://ip:3002` e `SEPARATOR_TOKEN=…` uguale.
+- **`drive`**: GPU gratuita di Google Colab, senza tunnel (vietati da Colab). Installa Google Drive per desktop, imposta `DRIVE_DIR` (es. `G:\Il mio Drive\reaper-copilot`) e avvia `npm start`: il copilot copia in `DRIVE_DIR\worker\` lo script e il notebook. Apri `colab_worker.ipynb` da Drive con Colab, scegli runtime GPU ed esegui le celle. I brani passano dalla cartella `inbox`, gli stem tornano in `outbox`.
+- **`off`**: nessuna separazione (si usa l'analisi a bande sul mix).
 
-## Learn More
+Modelli: `htdemucs_6s.yaml` (6 stem, default), `htdemucs_ft.yaml` (4 stem, più preciso e più lento) o qualsiasi modello supportato da [audio-separator](https://github.com/nomadkaraoke/python-audio-separator).
 
-You can learn more in the [Create React App documentation](https://facebook.github.io/create-react-app/docs/getting-started).
+## Limiti
 
-To learn React, check out the [React documentation](https://reactjs.org/).
-
-### Code Splitting
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/code-splitting](https://facebook.github.io/create-react-app/docs/code-splitting)
-
-### Analyzing the Bundle Size
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/analyzing-the-bundle-size](https://facebook.github.io/create-react-app/docs/analyzing-the-bundle-size)
-
-### Making a Progressive Web App
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/making-a-progressive-web-app](https://facebook.github.io/create-react-app/docs/making-a-progressive-web-app)
-
-### Advanced Configuration
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/advanced-configuration](https://facebook.github.io/create-react-app/docs/advanced-configuration)
-
-### Deployment
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/deployment](https://facebook.github.io/create-react-app/docs/deployment)
-
-### `npm run build` fails to minify
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/troubleshooting#npm-run-build-fails-to-minify](https://facebook.github.io/create-react-app/docs/troubleshooting#npm-run-build-fails-to-minify)
+- Gli stem separati hanno un po' di artefatti e rientri: differenze piccole vanno prese con le pinze.
+- Il carattere di un suono (ampli, distorsione, feel della compressione) si vede solo in parte nei numeri: il modello lo integra con la conoscenza di come quel suono veniva prodotto.
+- Le analisi del tuo mix richiedono render reali: per iterare conviene una time selection sul ritornello.
+- La chat è una finestra a parte affiancata (REAPER non ha un browser integrato).

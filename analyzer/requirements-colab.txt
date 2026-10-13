@@ -1,0 +1,2 @@
+audio-separator[gpu]>=0.47
+audioread>=3.0

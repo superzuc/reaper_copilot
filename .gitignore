@@ -21,3 +21,12 @@
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+# reaper copilot
+/data
+.env
+/reaper/ipc
+/reaper/renders
+/analyzer/.venv
+/analyzer/models
+/analyzer/work
