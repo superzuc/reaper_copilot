@@ -43,6 +43,8 @@ function makeTier(prefix, fallback) {
       (provider === 'anthropic' ? env.ANTHROPIC_API_KEY : env.OPENAI_API_KEY) || '',
     envModel: get('MODEL') || '',
     price: parsePrice(get('PRICE_PER_MTOK')),
+    effort: (get('EFFORT') || '').toLowerCase(),
+    effortFromEnv: Boolean(get('EFFORT')),
     runtimeModel: '',
   };
   tier.presets = provider === 'anthropic' ? ANTHROPIC_PRESETS : [];
@@ -53,6 +55,9 @@ const strong = makeTier('LLM_', null);
 if (!strong.envModel) strong.envModel = env.ANTHROPIC_MODEL || (strong.provider === 'anthropic' ? 'claude-sonnet-5-5' : '');
 const fast = makeTier('LLM_FAST_', strong);
 if (!fast.envModel && fast.provider === 'anthropic') fast.envModel = 'claude-haiku-5-5';
+// sforzo (quanto ragiona il modello): meno sforzo = meno token in uscita = meno costo
+if (!strong.effort && strong.provider === 'anthropic') strong.effort = 'medium';
+if (!fast.effort && fast.provider === 'anthropic') fast.effort = 'low';
 const tiers = { strong, fast };
 const routing = { mode: (env.ROUTING || 'auto').toLowerCase(), runtimeMode: '' };
 
@@ -110,7 +115,7 @@ function routingMode() {
 
 module.exports = {
   root,
-  port: Number(env.PORT || 3001),
+  port: Number(env.SERVER_PORT || 3001),
   dataDir,
   ipcDir: env.REAPER_IPC_DIR || path.join(root, 'reaper', 'ipc'),
   rendersDir: path.join(dataDir, 'renders'),

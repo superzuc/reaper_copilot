@@ -11,19 +11,15 @@ const agent = require('./agent');
 const audio = require('./audio');
 const separation = require('./separation');
 const usage = require('./usage');
+const store = require('./store');
 
 const app = express();
 app.use(express.json({ limit: '2mb' }));
 
 const upload = multer({ dest: path.join(os.tmpdir(), 'reaper-copilot-uploads'), limits: { fileSize: 300 * 1024 * 1024 } });
 
-// una conversazione per id di sessione (in memoria)
-const sessions = new Map();
+// una chat per progetto REAPER, salvata su disco (store.js)
 const running = new Map();
-function getSession(id) {
-  if (!sessions.has(id)) sessions.set(id, { id, messages: [] });
-  return sessions.get(id);
-}
 
 let ffmpegOk = null;
 function checkFfmpeg() {
@@ -40,6 +36,7 @@ function checkFfmpeg() {
 app.get('/api/status', async (req, res) => {
   res.json({
     reaper: reaper.status(),
+    project: store.currentProject(),
     tiers: Object.fromEntries(Object.entries(config.tiers).map(([name, t]) => [name, {
       provider: t.provider,
       baseUrl: t.provider === 'openai' ? t.baseUrl : undefined,
@@ -78,10 +75,26 @@ app.post('/api/settings', (req, res) => {
   res.json({ ok: true });
 });
 
+function chatPayload() {
+  const project = store.currentProject();
+  const chat = store.load(project.key, project);
+  return {
+    project,
+    turns: chat.turns || [],
+    notes: chat.notes || '',
+    prefs: store.readPrefs(),
+    running: running.has(project.key),
+  };
+}
+
+app.get('/api/chat', (req, res) => res.json(chatPayload()));
+
 app.post('/api/chat', async (req, res) => {
-  const { sessionId = 'default', message } = req.body || {};
+  const { message } = req.body || {};
   if (!message || !String(message).trim()) return res.status(400).json({ error: 'messaggio vuoto' });
-  if (running.has(sessionId)) return res.status(409).json({ error: 'sto ancora lavorando alla richiesta precedente' });
+  const project = store.currentProject();
+  const chat = store.load(project.key, project);
+  if (running.has(project.key)) return res.status(409).json({ error: 'sto ancora lavorando alla richiesta precedente' });
 
   res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -89,37 +102,76 @@ app.post('/api/chat', async (req, res) => {
   res.flushHeaders();
 
   const controller = new AbortController();
-  running.set(sessionId, controller);
+  running.set(project.key, controller);
   res.on('close', () => { if (!res.writableFinished) controller.abort(); });
-  const emit = (ev) => { if (!res.writableEnded) res.write(JSON.stringify(ev) + '\n'); };
+
+  // registro anche la versione "da mostrare" del turno, per ritrovarla dopo un riavvio
+  const userTurn = { role: 'user', text: String(message), t: new Date().toISOString() };
+  const aTurn = { role: 'assistant', parts: [], usage: { in: 0, out: 0, cost: null } };
+  const record = (ev) => {
+    if (ev.type === 'text') aTurn.parts.push({ kind: 'text', text: ev.text });
+    else if (ev.type === 'tool_call') aTurn.parts.push({ kind: 'tool', id: ev.id, name: ev.name, input: ev.input, status: 'running' });
+    else if (ev.type === 'tool_result') {
+      const p = aTurn.parts.find((x) => x.id === ev.id);
+      if (p) { p.status = ev.ok ? 'ok' : 'error'; p.preview = String(ev.preview || '').slice(0, 300); }
+    } else if (ev.type === 'model') aTurn.parts.push({ kind: 'model', tier: ev.tier, model: ev.model, effort: ev.effort, reason: ev.reason });
+    else if (ev.type === 'error') aTurn.parts.push({ kind: 'error', text: ev.error });
+    else if (ev.type === 'usage') {
+      aTurn.usage.in += ev.in || 0;
+      aTurn.usage.out += ev.out || 0;
+      if (ev.cost != null) aTurn.usage.cost = (aTurn.usage.cost || 0) + ev.cost;
+    }
+  };
+  const emit = (ev) => {
+    record(ev);
+    if (!res.writableEnded) res.write(JSON.stringify(ev) + '\n');
+  };
 
   try {
-    await agent.run(getSession(sessionId), String(message), emit, controller.signal);
+    await agent.run(chat, String(message), emit, controller.signal);
     emit({ type: 'done' });
   } catch (e) {
-    if (controller.signal.aborted) emit({ type: 'done', aborted: true });
-    else emit({ type: 'error', error: e.message || String(e) });
+    if (controller.signal.aborted) {
+      aTurn.parts.push({ kind: 'text', text: '_Interrotto._' });
+      emit({ type: 'done', aborted: true });
+    } else emit({ type: 'error', error: e.message || String(e) });
   } finally {
-    running.delete(sessionId);
+    for (const p of aTurn.parts) if (p.status === 'running') p.status = 'error';
+    chat.turns = [...(chat.turns || []), userTurn, aTurn].slice(-300);
+    store.save(chat);
+    running.delete(project.key);
     res.end();
   }
 });
 
-app.get('/api/usage', (req, res) => res.json(usage.summary(Number(req.query.days) || 30)));
-
 app.post('/api/chat/stop', (req, res) => {
-  const c = running.get((req.body && req.body.sessionId) || 'default');
+  const c = running.get(store.currentProject().key);
   if (c) c.abort();
   res.json({ ok: true });
 });
 
 app.post('/api/chat/reset', (req, res) => {
-  const id = (req.body && req.body.sessionId) || 'default';
-  const c = running.get(id);
+  const project = store.currentProject();
+  const c = running.get(project.key);
   if (c) c.abort();
-  sessions.delete(id);
+  store.clearChat(store.load(project.key, project));
   res.json({ ok: true });
 });
+
+app.get('/api/memory', (req, res) => {
+  const p = chatPayload();
+  res.json({ project: p.project, notes: p.notes, prefs: p.prefs });
+});
+
+app.post('/api/memory', (req, res) => {
+  const project = store.currentProject();
+  const chat = store.load(project.key, project);
+  if (typeof req.body.notes === 'string') store.setNotes(chat, req.body.notes);
+  if (typeof req.body.prefs === 'string') store.writePrefs(req.body.prefs);
+  res.json({ ok: true });
+});
+
+app.get('/api/usage', (req, res) => res.json(usage.summary(Number(req.query.days) || 30)));
 
 app.get('/api/references', (req, res) => res.json(references.list()));
 
@@ -151,6 +203,8 @@ const buildDir = path.join(config.root, 'build');
 if (fs.existsSync(buildDir)) {
   app.use(express.static(buildDir));
   app.get(/^\/(?!api\/).*/, (req, res) => res.sendFile(path.join(buildDir, 'index.html')));
+} else {
+  app.get('/', (req, res) => res.type('html').send('<p style="font-family:sans-serif">Questo è il server del copilot. La chat è su <a href="http://localhost:3000">http://localhost:3000</a> (oppure lancia <code>npm run app</code> per servirla da qui).</p>'));
 }
 
 app.listen(config.port, '127.0.0.1', () => {

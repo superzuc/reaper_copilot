@@ -5,6 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 const config = require('./config');
+const audio = require('./audio');
 
 const sep = config.separator;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -46,6 +47,17 @@ function pythonCommand() {
   return { cmd: process.platform === 'win32' ? 'py' : 'python3', args: process.platform === 'win32' ? ['-3'] : [] };
 }
 
+// la libreria di separazione cerca "ffmpeg" nel PATH: uso quello di ffmpeg-static se c'è
+function envWithFfmpeg(extra = {}) {
+  const env = { ...process.env, ...extra };
+  const ff = audio.ffmpegPath();
+  if (path.isAbsolute(ff) && fs.existsSync(ff)) {
+    const key = Object.keys(env).find((k) => k.toLowerCase() === 'path') || 'PATH';
+    env[key] = path.dirname(ff) + path.delimiter + (env[key] || '');
+  }
+  return env;
+}
+
 async function ensureLocalService() {
   if (await health()) return;
   if (starting) return starting;
@@ -55,7 +67,7 @@ async function ensureLocalService() {
     childLog = '';
     child = spawn(cmd, [...args, path.join(config.analyzerDir, 'service.py'), '--host', url.hostname, '--port', url.port || '3002'], {
       cwd: config.analyzerDir,
-      env: { ...process.env, SEPARATOR_MODEL: sep.model, ANALYZER_TOKEN: sep.token, PYTHONUNBUFFERED: '1' },
+      env: envWithFfmpeg({ SEPARATOR_MODEL: sep.model, ANALYZER_TOKEN: sep.token, PYTHONUNBUFFERED: '1' }),
       windowsHide: true,
     });
     const onData = (d) => {
@@ -73,7 +85,9 @@ async function ensureLocalService() {
       if (await health()) return;
       await sleep(500);
     }
-    const hint = /No module named|ModuleNotFoundError/.test(childLog)
+    const hint = /FFmpeg is not installed/i.test(childLog)
+      ? 'ffmpeg non trovato: esegui "npm install" (installa ffmpeg-static) oppure installa ffmpeg nel sistema.'
+      : /No module named|ModuleNotFoundError/.test(childLog)
       ? 'Mancano le librerie Python: esegui "npm run analyzer:setup".'
       : 'Esegui "npm run analyzer:setup" e controlla che Python sia installato.';
     throw new Error(`Servizio di separazione non avviato. ${hint}\n${childLog.slice(-600)}`);

@@ -21,6 +21,7 @@ function status() {
     return {
       connected: hb.state === 'running' && age < 4000,
       project: hb.project || null,
+      projectPath: hb.project_path || '',
       reaper: hb.reaper || null,
       bridge: hb.bridge || null,
     };

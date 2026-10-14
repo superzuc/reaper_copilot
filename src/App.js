@@ -9,22 +9,6 @@ const SUGGESTIONS = [
   'Dai al basso un suono più presente e definito',
 ];
 
-function makeId() {
-  return Math.random().toString(36).slice(2) + Date.now().toString(36);
-}
-
-function sessionIdFromStorage() {
-  try {
-    const existing = window.localStorage.getItem('copilot-session');
-    if (existing) return existing;
-    const id = makeId();
-    window.localStorage.setItem('copilot-session', id);
-    return id;
-  } catch (_) {
-    return makeId();
-  }
-}
-
 /* ------------------------------------------------------------------ */
 /* Status                                                             */
 /* ------------------------------------------------------------------ */
@@ -273,6 +257,58 @@ function References() {
   );
 }
 
+function Memory({ version }) {
+  const [open, setOpen] = useState(false);
+  const [data, setData] = useState({ notes: '', prefs: '', project: null });
+  const [draft, setDraft] = useState(null);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    fetch('/api/memory').then((r) => r.json()).then((d) => { setData(d); setDraft(null); }).catch(() => {});
+  }, [version]);
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      await fetch('/api/memory', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(draft) });
+      setData((d) => ({ ...d, ...draft }));
+      setDraft(null);
+    } finally {
+      setSaving(false);
+    }
+  };
+  const cur = draft || data;
+  const filled = (data.notes ? 1 : 0) + (data.prefs ? 1 : 0);
+  const area = 'w-full resize-y rounded-md border border-[#33363d] bg-[#25272c] px-2 py-1.5 font-mono text-[11.5px] leading-snug text-[#d9dbe0] outline-none focus:border-[#e8a33d]';
+
+  return (
+    <div className="border-b border-[#2c2f35]">
+      <button type="button" onClick={() => setOpen(!open)} className="flex w-full items-center justify-between px-3 py-2 text-left text-[12px] uppercase tracking-[0.08em] text-[#8b8f98] hover:text-[#d9dbe0]">
+        <span>Memoria <span className="font-mono normal-case tracking-normal text-[#6d717a]">({filled}/2)</span></span>
+        <span className="font-mono">{open ? '−' : '+'}</span>
+      </button>
+      {open && (
+        <div className="space-y-2.5 px-3 pb-3 text-[12px]">
+          <label className="block">
+            <span className="mb-1 block text-[#8b8f98]">Le tue preferenze <span className="text-[#6d717a]">· tutti i progetti</span></span>
+            <textarea rows={4} value={cur.prefs} placeholder="es. voce sempre davanti, master a -14 LUFS, niente riverberi lunghi" onChange={(e) => setDraft({ ...cur, prefs: e.target.value })} className={area} />
+          </label>
+          <label className="block">
+            <span className="mb-1 block text-[#8b8f98]">Note del progetto <span className="text-[#6d717a]">· {data.project ? data.project.name : ''}</span></span>
+            <textarea rows={6} value={cur.notes} placeholder="Il copilot le aggiorna da solo dopo i mix" onChange={(e) => setDraft({ ...cur, notes: e.target.value })} className={area} />
+          </label>
+          {draft && (
+            <div className="flex justify-end gap-2">
+              <button type="button" onClick={() => setDraft(null)} className="rounded-md px-2.5 py-1 text-[#8b8f98] hover:text-[#d9dbe0]">Annulla</button>
+              <button type="button" disabled={saving} onClick={save} className="rounded-md bg-[#e8a33d] px-2.5 py-1 font-semibold text-[#1a1407] disabled:opacity-50">Salva</button>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ------------------------------------------------------------------ */
 /* Messages                                                           */
 /* ------------------------------------------------------------------ */
@@ -325,7 +361,7 @@ function AssistantTurn({ turn, running }) {
           return (
             <div key={i} className="flex items-center gap-1.5 font-mono text-[10.5px] text-[#6d717a]" title={g.reason}>
               <span className={fast ? 'text-[#7fb7e8]' : 'text-[#e8a33d]'}>{fast ? '⚡ veloce' : (i > 0 ? '↑ esperto' : '★ esperto')}</span>
-              <span className="truncate">{String(g.model || '').replace(/^claude-/, '')}{i > 0 && g.reason ? ` · ${g.reason}` : ''}</span>
+              <span className="truncate">{String(g.model || '').replace(/^claude-/, '')}{g.effort ? ` · ${g.effort}` : ''}{g.reason ? ` · ${g.reason}` : ''}</span>
             </div>
           );
         }
@@ -352,8 +388,10 @@ function AssistantTurn({ turn, running }) {
 /* ------------------------------------------------------------------ */
 export default function App() {
   const [status, refreshStatus] = useStatus();
-  const [sessionId, setSessionId] = useState(sessionIdFromStorage);
   const [turns, setTurns] = useState([]);
+  const [memoryVersion, setMemoryVersion] = useState(0);
+  const projectKey = status && status.project ? status.project.key : null;
+  const loadedKey = useRef(null);
   const [input, setInput] = useState('');
   const [running, setRunning] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
@@ -365,6 +403,16 @@ export default function App() {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [turns]);
+
+  // carica la chat salvata del progetto aperto in REAPER (e quando cambi progetto)
+  useEffect(() => {
+    if (!projectKey || running || loadedKey.current === projectKey) return;
+    loadedKey.current = projectKey;
+    fetch('/api/chat').then((r) => r.json()).then((data) => {
+      setTurns(data.turns || []);
+      setMemoryVersion((v) => v + 1);
+    }).catch(() => {});
+  }, [projectKey, running]);
 
   useEffect(() => {
     const el = textRef.current;
@@ -386,7 +434,7 @@ export default function App() {
     else if (ev.type === 'tool_call') updateLast((ps) => [...ps, { kind: 'tool', id: ev.id, name: ev.name, input: ev.input, status: 'running' }]);
     else if (ev.type === 'tool_result') updateLast((ps) => ps.map((p) => (p.id === ev.id ? { ...p, status: ev.ok ? 'ok' : 'error', preview: ev.preview } : p)));
     else if (ev.type === 'error') updateLast((ps) => [...ps, { kind: 'error', text: ev.error }]);
-    else if (ev.type === 'model') updateLast((ps) => [...ps, { kind: 'model', tier: ev.tier, model: ev.model, reason: ev.reason }]);
+    else if (ev.type === 'model') updateLast((ps) => [...ps, { kind: 'model', tier: ev.tier, model: ev.model, effort: ev.effort, reason: ev.reason }]);
     else if (ev.type === 'usage') {
       setTurns((ts) => {
         const copy = ts.slice();
@@ -412,7 +460,7 @@ export default function App() {
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionId, message: text }),
+        body: JSON.stringify({ message: text }),
         signal: controller.signal,
       });
       if (!res.ok || !res.body) {
@@ -443,12 +491,13 @@ export default function App() {
     } finally {
       setRunning(false);
       abortRef.current = null;
+      setMemoryVersion((v) => v + 1); // il modello potrebbe aver aggiornato le note
     }
   };
 
   const stop = async () => {
     try {
-      await fetch('/api/chat/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId }) });
+      await fetch('/api/chat/stop', { method: 'POST' });
     } catch (_) { /* ignore */ }
     if (abortRef.current) abortRef.current.abort();
   };
@@ -456,11 +505,8 @@ export default function App() {
   const newChat = async () => {
     if (running) await stop();
     try {
-      await fetch('/api/chat/reset', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId }) });
+      await fetch('/api/chat/reset', { method: 'POST' });
     } catch (_) { /* ignore */ }
-    const id = makeId();
-    try { window.localStorage.setItem('copilot-session', id); } catch (_) { /* ignore */ }
-    setSessionId(id);
     setTurns([]);
   };
 
@@ -485,7 +531,7 @@ export default function App() {
           <button type="button" onClick={() => setShowSettings(!showSettings)} className={`max-w-[110px] truncate rounded px-1.5 py-1 font-mono text-[11px] hover:bg-[#2a2c31] ${showSettings ? 'text-[#e8a33d]' : 'text-[#8b8f98]'}`} title="Impostazioni">
             {modelLabel || '⚙'}
           </button>
-          <button type="button" onClick={newChat} className="rounded px-1.5 py-1 text-[15px] leading-none text-[#8b8f98] hover:bg-[#2a2c31] hover:text-[#d9dbe0]" title="Nuova chat">＋</button>
+          <button type="button" onClick={newChat} className="rounded px-1.5 py-1 text-[15px] leading-none text-[#8b8f98] hover:bg-[#2a2c31] hover:text-[#d9dbe0]" title="Nuova chat (la memoria resta)">＋</button>
         </div>
       </header>
 
@@ -506,6 +552,7 @@ export default function App() {
       )}
 
       <References />
+      <Memory version={memoryVersion} />
 
       {/* Conversation */}
       <main ref={scrollRef} className="flex-1 overflow-y-auto px-3 py-3">

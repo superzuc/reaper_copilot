@@ -12,6 +12,17 @@ const venv = path.join(dir, '.venv');
 const win = process.platform === 'win32';
 const gpu = process.argv.includes('--gpu');
 
+// la libreria di separazione cerca "ffmpeg" nel PATH: aggiungo quello di ffmpeg-static
+try {
+  const ff = require('ffmpeg-static');
+  if (ff && fs.existsSync(ff)) {
+    const key = Object.keys(process.env).find((k) => k.toLowerCase() === 'path') || 'PATH';
+    process.env[key] = path.dirname(ff) + path.delimiter + (process.env[key] || '');
+  }
+} catch (_) {
+  console.log('Attenzione: ffmpeg-static non trovato (esegui prima "npm install").');
+}
+
 function run(cmd, args, opts = {}) {
   console.log(`> ${cmd} ${args.join(' ')}`);
   const r = spawnSync(cmd, args, { stdio: 'inherit', cwd: dir, ...opts });

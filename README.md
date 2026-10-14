@@ -41,11 +41,20 @@ Il copilot usa due modelli, configurati nel `.env` (dettagli ed esempi in `.env.
 
 Con `ROUTING=auto` la scelta è automatica: le richieste di mix/analisi vanno subito all'esperto, il resto al veloce. Il veloce passa la mano all'esperto (con un tool `escalate`) se la richiesta è più complessa del previsto, se prova a fare un'analisi, se sbaglia due volte di fila o se supera `FAST_MAX_STEPS` passaggi. Nella chat vedi quale modello ha risposto e quanti token ha consumato.
 
+Prima di ogni richiesta un **classificatore** (una chiamata brevissima al modello veloce, senza comandi e senza ragionamento, circa 0,0001 $) decide livello e sforzo: comandi semplici → veloce/low, analisi → veloce/medium, ritocchi di suono → esperto/medium, mix completi e reference → esperto/high. Funziona in qualsiasi lingua; se non risponde decidono le regole a parole chiave (`CLASSIFIER=off` per usare solo quelle). L'esperto lavora sempre almeno a "medium" e alza lo sforzo una sola volta, solo su segnali oggettivi (errori ripetuti o lavoro lungo).
+
 I due livelli possono stare su provider diversi (es. veloce su Gemini, esperto su Claude). Provider supportati: Anthropic e qualsiasi API compatibile OpenAI (OpenRouter, OpenAI, Gemini, DeepSeek, Ollama in locale…).
 
 **Costi**: ogni chiamata viene registrata in `data/usage.jsonl` (token, modello, livello). Se nel `.env` metti i prezzi (`LLM_PRICE_PER_MTOK`, `LLM_FAST_PRICE_PER_MTOK`), la chat mostra anche il costo stimato per risposta e `GET /api/usage` dà i totali per modello e per giorno: utile per decidere il prezzo dell'abbonamento.
 
 Dalla UI (clic su "auto" in alto) puoi forzare sempre veloce / sempre esperto o cambiare modello al volo; vale fino al riavvio.
+
+## Memoria e chat salvate
+
+- Ogni progetto REAPER ha la sua chat, salvata in `data/chats/`: riaprendo il progetto (anche dopo un riavvio) ritrovi la conversazione. Il "＋" in alto inizia una chat nuova, la memoria resta.
+- Al modello non arriva la chat intera: le richieste precedenti sono riassunte (richiesta, azioni fatte, risposta finale).
+- **Memoria**: pannello con le tue preferenze (valide per tutti i progetti, `data/preferences.md`) e le note del progetto. Il copilot le aggiorna da solo; puoi modificarle a mano.
+- `CACHE_TTL=1h` tiene istruzioni e comandi nella cache di Anthropic per un'ora.
 
 ## Separazione stem: dove gira
 

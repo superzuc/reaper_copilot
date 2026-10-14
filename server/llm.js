@@ -19,17 +19,32 @@ function withCacheBreakpoint(messages) {
   return out;
 }
 
-async function anthropicComplete({ tier, system, tools, messages, signal }) {
+const CACHE_TTL = (process.env.CACHE_TTL || '1h').toLowerCase();
+const longCache = CACHE_TTL === '1h' ? { type: 'ephemeral', ttl: '1h' } : { type: 'ephemeral' };
+
+function systemParts(system) {
+  return typeof system === 'string' ? { static: system, memory: '' } : { static: system.static, memory: system.memory || '' };
+}
+
+async function anthropicComplete({ tier, system, tools, messages, signal, effort, maxTokens, model, light }) {
   const opts = { apiKey: config.tierKey(tier) };
   if (tier.baseUrl) opts.baseURL = tier.baseUrl;
   const client = new Anthropic(opts);
-  const cachedTools = tools.map((t, i) => (i === tools.length - 1 ? { ...t, cache_control: { type: 'ephemeral' } } : t));
+  // parte fissa (tools + istruzioni) in cache lunga; memoria e messaggi in cache da 5 minuti
+  const cachedTools = tools.map((t, i) => (i === tools.length - 1 ? { ...t, cache_control: longCache } : t));
+  const sp = systemParts(system);
+  const systemBlocks = [{ type: 'text', text: sp.static, ...(light ? {} : { cache_control: longCache }) }];
+  if (sp.memory) systemBlocks.push({ type: 'text', text: sp.memory });
+  const useModel = model || config.tierModel(tier);
   const resp = await client.messages.create({
-    model: config.tierModel(tier),
-    max_tokens: MAX_TOKENS,
-    system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
-    tools: cachedTools,
-    messages: withCacheBreakpoint(messages),
+    model: useModel,
+    max_tokens: maxTokens || MAX_TOKENS,
+    system: systemBlocks,
+    ...(cachedTools.length ? { tools: cachedTools } : {}),
+    messages: light ? messages : withCacheBreakpoint(messages),
+    ...(effort || tier.effort ? { output_config: { effort: effort || tier.effort } } : {}),
+    // chiamate leggere (classificatore): niente ragionamento su Haiku
+    ...(light && /haiku/i.test(useModel) ? { thinking: { type: 'disabled' } } : {}),
   }, { signal });
   return { content: resp.content, stop_reason: resp.stop_reason, usage: resp.usage };
 }
@@ -51,7 +66,7 @@ function simplifySchema(node) {
   return out;
 }
 
-function toOpenAIMessages(system, messages) {
+function toOpenAIMessages(system, messages, { passReasoning = false } = {}) {
   const out = [{ role: 'system', content: system }];
   for (const m of messages) {
     if (typeof m.content === 'string') {
@@ -65,6 +80,10 @@ function toOpenAIMessages(system, messages) {
       }));
       const msg = { role: 'assistant', content: text || null };
       if (calls.length) msg.tool_calls = calls;
+      // DeepSeek (e altri modelli con ragionamento) vogliono indietro il reasoning_content
+      // in tutte le richieste con tools, altrimenti rispondono 400
+      const reasoning = m.content.filter((b) => b.type === 'reasoning').map((b) => b.text).join('\n');
+      if (passReasoning || reasoning) msg.reasoning_content = reasoning;
       out.push(msg);
       continue;
     }
@@ -81,7 +100,7 @@ function toOpenAIMessages(system, messages) {
   return out;
 }
 
-async function openaiComplete({ tier, system, tools, messages, signal }) {
+async function openaiComplete({ tier, system, tools, messages, signal, effort, maxTokens, model }) {
   const headers = { 'Content-Type': 'application/json' };
   const key = config.tierKey(tier);
   if (key) headers.Authorization = `Bearer ${key}`;
@@ -90,12 +109,21 @@ async function openaiComplete({ tier, system, tools, messages, signal }) {
     headers['X-Title'] = 'REAPER Copilot';
   }
   const body = {
-    model: config.tierModel(tier),
-    messages: toOpenAIMessages(system, messages),
-    tools: tools.map((t) => ({ type: 'function', function: { name: t.name, description: t.description, parameters: simplifySchema(t.input_schema) } })),
-    tool_choice: 'auto',
+    model: model || config.tierModel(tier),
+    messages: toOpenAIMessages(
+      (() => { const sp = systemParts(system); return sp.memory ? `${sp.static}\n\n${sp.memory}` : sp.static; })(),
+      messages,
+      { passReasoning: /deepseek/i.test(tier.baseUrl) },
+    ),
   };
-  if (process.env.LLM_MAX_TOKENS) body.max_tokens = MAX_TOKENS;
+  if (tools.length) {
+    body.tools = tools.map((t) => ({ type: 'function', function: { name: t.name, description: t.description, parameters: simplifySchema(t.input_schema) } }));
+    body.tool_choice = 'auto';
+  }
+  if (maxTokens) body.max_tokens = maxTokens;
+  if (process.env.LLM_MAX_TOKENS && !maxTokens) body.max_tokens = MAX_TOKENS;
+  // per i provider compatibili OpenAI lo sforzo si manda solo se impostato nel .env
+  if (tier.effortFromEnv) body.reasoning_effort = effort || tier.effort;
 
   const res = await fetch(`${tier.baseUrl}/chat/completions`, { method: 'POST', headers, body: JSON.stringify(body), signal });
   const raw = await res.text();
@@ -107,6 +135,7 @@ async function openaiComplete({ tier, system, tools, messages, signal }) {
   if (!choice) throw new Error('Risposta vuota dal provider');
   const msg = choice.message || {};
   const content = [];
+  if (msg.reasoning_content) content.push({ type: 'reasoning', text: msg.reasoning_content });
   if (msg.content) content.push({ type: 'text', text: msg.content });
   for (const c of msg.tool_calls || []) {
     let input = {};
@@ -122,7 +151,9 @@ async function openaiComplete({ tier, system, tools, messages, signal }) {
     usage: {
       input_tokens: u.prompt_tokens || 0,
       output_tokens: u.completion_tokens || 0,
-      cache_read_input_tokens: (u.prompt_tokens_details && u.prompt_tokens_details.cached_tokens) || 0,
+      cache_read_input_tokens: u.prompt_cache_hit_tokens != null
+        ? u.prompt_cache_hit_tokens // DeepSeek
+        : (u.prompt_tokens_details && u.prompt_tokens_details.cached_tokens) || 0,
     },
   };
 }
@@ -132,7 +163,7 @@ async function complete(args) {
   if (config.keyRequired(tier) && !config.tierKey(tier)) {
     throw new Error('Manca la API key: imposta LLM_API_KEY (e LLM_FAST_API_KEY se usi un altro provider) nel file .env.');
   }
-  if (!config.tierModel(tier)) throw new Error('Manca il nome del modello: imposta LLM_MODEL nel file .env.');
+  if (!args.model && !config.tierModel(tier)) throw new Error('Manca il nome del modello: imposta LLM_MODEL nel file .env.');
   return tier.provider === 'anthropic' ? anthropicComplete(args) : openaiComplete(args);
 }
 

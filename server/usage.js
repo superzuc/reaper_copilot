@@ -10,7 +10,13 @@ function billedInput(provider, u) {
   const input = u.input_tokens || 0;
   const read = u.cache_read_input_tokens || 0;
   const write = u.cache_creation_input_tokens || 0;
-  if (provider === 'anthropic') return input + write * 1.25 + read * 0.1; // input_tokens esclude la cache
+  if (provider === 'anthropic') {
+    // input_tokens esclude la cache; scrittura 5 min = 1.25x, 1 ora = 2x; lettura ~0.1x (0.05x su Sonnet/Opus 5.5)
+    const cc = u.cache_creation || {};
+    const w1h = cc.ephemeral_1h_input_tokens || 0;
+    const w5m = cc.ephemeral_5m_input_tokens != null ? cc.ephemeral_5m_input_tokens : write - w1h;
+    return input + w5m * 1.25 + w1h * 2 + read * 0.1;
+  }
   return input - read + read * 0.5; // OpenAI-compatibili: prompt_tokens include la cache (sconto variabile)
 }
 

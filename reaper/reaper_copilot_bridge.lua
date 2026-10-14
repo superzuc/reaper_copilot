@@ -3,7 +3,7 @@
 -- Resta in esecuzione in background e scambia comandi JSON con il server Node
 -- tramite la cartella "ipc" accanto allo script.
 
-local VERSION = "0.1.0"
+local VERSION = "0.3.1"
 
 ---------------------------------------------------------------------------
 -- Paths
@@ -269,10 +269,15 @@ end
 
 -- Imposta un parametro cercando il valore normalizzato che produce il valore
 -- visualizzato richiesto (es. 120 per "120 Hz", -3 per "-3.0 dB").
-local function set_param_by_display(tr, fx, p, target)
+-- Trova il valore normalizzato (0..1) che produce il valore visualizzato richiesto
+-- (es. 120 per "120 Hz", -3 per "-3.0 dB"). Non lascia modifiche al parametro.
+local function find_norm_for_display(tr, fx, p, target)
+  local original = reaper.TrackFX_GetParamNormalized(tr, fx, p)
+  local touched = false
   local function probe(x)
     local ok, s = reaper.TrackFX_FormatParamValueNormalized(tr, fx, p, x, "")
     if not ok or s == "" then
+      touched = true
       reaper.TrackFX_SetParamNormalized(tr, fx, p, x)
       s = formatted(tr, fx, p)
     end
@@ -290,7 +295,42 @@ local function set_param_by_display(tr, fx, p, target)
   end
   local vlo, vhi = probe(lo), probe(hi)
   local best = (math.abs((vlo or 1e12) - target) <= math.abs((vhi or 1e12) - target)) and lo or hi
+  if touched then reaper.TrackFX_SetParamNormalized(tr, fx, p, original) end
+  return best
+end
+
+-- ricerca "vera": imposta il parametro e rilegge il valore visualizzato (più lenta ma affidabile)
+local function search_by_setting(tr, fx, p, target)
+  local function probe(x)
+    reaper.TrackFX_SetParamNormalized(tr, fx, p, x)
+    return parse_num(formatted(tr, fx, p))
+  end
+  local v0, v1 = probe(0), probe(1)
+  if v0 == nil or v1 == nil then error("il parametro " .. param_name(tr, fx, p) .. " non ha un valore numerico") end
+  local increasing = v1 >= v0
+  local lo, hi = 0.0, 1.0
+  for _ = 1, 40 do
+    local mid = (lo + hi) / 2
+    local v = probe(mid)
+    if v == nil then break end
+    if (v < target) == increasing then lo = mid else hi = mid end
+  end
+  local vlo, vhi = probe(lo), probe(hi)
+  return (math.abs((vlo or 1e12) - target) <= math.abs((vhi or 1e12) - target)) and lo or hi
+end
+
+local function close_enough(v, target)
+  return v ~= nil and math.abs(v - target) <= math.max(0.05 * math.abs(target), 0.1)
+end
+
+local function set_param_by_display(tr, fx, p, target)
+  local best = find_norm_for_display(tr, fx, p, target)
   reaper.TrackFX_SetParamNormalized(tr, fx, p, best)
+  -- alcuni plugin/versioni formattano in modo inaffidabile i valori ipotetici: verifico
+  if not close_enough(parse_num(formatted(tr, fx, p)), target) then
+    best = search_by_setting(tr, fx, p, target)
+    reaper.TrackFX_SetParamNormalized(tr, fx, p, best)
+  end
   return best
 end
 
@@ -365,21 +405,26 @@ local function render(args)
     saved_str[k] = v
   end
 
-  -- solo della traccia richiesta (solo-in-place) se non è il master
+  -- solo delle tracce richieste (solo-in-place); "targets" = più tracce insieme (es. tutta la batteria)
   local saved_solo = {}
   local warn
-  local solo_target = nil
-  if target ~= "master" and target ~= -1 and target ~= "MASTER" then
-    solo_target = get_track(target)
-    if reaper.GetMediaTrackInfo_Value(solo_target, "B_MUTE") == 1 then
-      warn = "la traccia è in mute: il render sarà silenzioso"
+  local solo_list = {}
+  if type(args.targets) == "table" and #args.targets > 0 then
+    for _, t in ipairs(args.targets) do solo_list[#solo_list + 1] = get_track(t) end
+  elseif target ~= "master" and target ~= -1 and target ~= "MASTER" then
+    solo_list[1] = get_track(target)
+  end
+  local solo_target = #solo_list > 0 or nil
+  if solo_target then
+    for _, tr in ipairs(solo_list) do
+      if reaper.GetMediaTrackInfo_Value(tr, "B_MUTE") == 1 then warn = "traccia in mute: " .. track_name(tr) end
     end
     for i = 0, reaper.CountTracks(0) - 1 do
       local tr = reaper.GetTrack(0, i)
       saved_solo[i] = reaper.GetMediaTrackInfo_Value(tr, "I_SOLO")
       reaper.SetMediaTrackInfo_Value(tr, "I_SOLO", 0)
     end
-    reaper.SetMediaTrackInfo_Value(solo_target, "I_SOLO", 2)
+    for _, tr in ipairs(solo_list) do reaper.SetMediaTrackInfo_Value(tr, "I_SOLO", 2) end
   end
 
   local bounds = args.bounds or "project"
@@ -439,7 +484,7 @@ function C.get_project(args)
   for i = 0, reaper.CountTracks(0) - 1 do
     tracks[#tracks + 1] = track_info(reaper.GetTrack(0, i), true)
   end
-  local _, num, den = reaper.TimeMap_GetTimeSigAtTime(0, 0)
+  local num, den = reaper.TimeMap_GetTimeSigAtTime(0, 0)
   return {
     project = proj_name,
     tempo = reaper.Master_GetTempo(),
@@ -510,11 +555,133 @@ function C.delete_track(args)
   return { deleted = name }
 end
 
+-- Elenco dei plugin installati. Con REAPER recenti uso EnumInstalledFX; altrimenti leggo
+-- i JSFX dalle cartelle Effects (riga "desc:") e i VST dalle cache di REAPER.
+local installed_cache = nil
+
+local function read_head(path, bytes)
+  local f = io.open(path, "rb")
+  if not f then return nil end
+  local s = f:read(bytes or 4096)
+  f:close()
+  return s
+end
+
+local SKIP_EXT = { png = 1, jpg = 1, txt = 1, ["jsfx-inc"] = 1, rpl = 1, dll = 1, ttf = 1, md = 1, ini = 1, wav = 1, html = 1, json = 1, lua = 1, eel = 1, py = 1 }
+
+local function scan_jsfx(root, rel, out, depth)
+  if depth > 5 or #out > 4000 then return end
+  local dir = root .. (rel ~= "" and (SEP .. rel) or "")
+  reaper.EnumerateFiles(dir, -1)
+  local i = 0
+  while true do
+    local f = reaper.EnumerateFiles(dir, i)
+    if not f then break end
+    local ext = f:match("%.([^.]+)$")
+    if not (ext and SKIP_EXT[ext:lower()]) then
+      local head = read_head(dir .. SEP .. f, 4096)
+      local desc = head and head:match("\ndesc:%s*([^\r\n]+)") or (head and head:match("^desc:%s*([^\r\n]+)"))
+      if desc then
+        local relpath = (rel ~= "" and (rel:gsub("\\", "/") .. "/") or "") .. f
+        out[#out + 1] = { name = "JS: " .. desc, add = "JS:" .. relpath, path = relpath }
+      end
+    end
+    i = i + 1
+  end
+  reaper.EnumerateSubdirectories(dir, -1)
+  local j = 0
+  while true do
+    local d = reaper.EnumerateSubdirectories(dir, j)
+    if not d then break end
+    scan_jsfx(root, rel ~= "" and (rel .. SEP .. d) or d, out, depth + 1)
+    j = j + 1
+  end
+end
+
+local function scan_vst_ini(path, out)
+  local f = io.open(path, "r")
+  if not f then return end
+  for line in f:lines() do
+    local file, rest = line:match("^([^=]+)=(.+)$")
+    if file and rest then
+      local name = rest:match("^[^,]*,[^,]*,(.+)$")
+      if name and name ~= "" and not name:find("^<SHELL>") then
+        name = name:gsub("!!!VSTi", "")
+        local prefix = file:lower():find("%.vst3$") and "VST3: " or "VST: "
+        out[#out + 1] = { name = prefix .. name, add = name }
+      end
+    end
+  end
+  f:close()
+end
+
+local function installed_fx()
+  if installed_cache then return installed_cache end
+  local out = {}
+  if reaper.EnumInstalledFX then
+    local i = 0
+    while true do
+      local ok, name, ident = reaper.EnumInstalledFX(i)
+      if not ok then break end
+      out[#out + 1] = { name = name, add = name }
+      i = i + 1
+    end
+  else
+    local res = reaper.GetResourcePath()
+    scan_jsfx(res .. SEP .. "Effects", "", out, 0)
+    if reaper.GetExePath then scan_jsfx(reaper.GetExePath() .. SEP .. "InstallData" .. SEP .. "Effects", "", out, 0) end
+    scan_vst_ini(res .. SEP .. "reaper-vstplugins64.ini", out)
+    scan_vst_ini(res .. SEP .. "reaper-vstplugins.ini", out)
+  end
+  -- tolgo i doppioni (stesso nome)
+  local seen, uniq = {}, {}
+  for _, e in ipairs(out) do
+    if not seen[e.name] then seen[e.name] = true; uniq[#uniq + 1] = e end
+  end
+  installed_cache = uniq
+  return uniq
+end
+
+local function find_installed(query, limit)
+  local q = tostring(query or ""):lower():gsub("^%a+%d?:%s*", "")
+  local exact, partial = {}, {}
+  for _, e in ipairs(installed_fx()) do
+    local n = e.name:lower():gsub("^%a+%d?:%s*", "")
+    if n == q or (e.path and e.path:lower() == q) then exact[#exact + 1] = e
+    elseif q == "" or n:find(q, 1, true) or (e.path and e.path:lower():find(q, 1, true)) then partial[#partial + 1] = e end
+    if #partial >= (limit or 200) then break end
+  end
+  for _, e in ipairs(partial) do exact[#exact + 1] = e end
+  return exact
+end
+
 MUTATING.add_fx = true
+local function add_fx_resolved(tr, name)
+  name = tostring(name or "")
+  local idx = reaper.TrackFX_AddByName(tr, name, false, -1)
+  if idx < 0 then
+    -- varianti del nome e ricerca tra i plugin installati
+    local tries = { (name:gsub("^(%a+%d?):%s+", "%1:")), (name:gsub("^%a+%d?:%s*", "")) }
+    for _, e in ipairs(find_installed(name, 20)) do tries[#tries + 1] = e.add end
+    for _, t in ipairs(tries) do
+      if t ~= "" and t ~= name then
+        idx = reaper.TrackFX_AddByName(tr, t, false, -1)
+        if idx >= 0 then break end
+      end
+    end
+  end
+  if idx < 0 then
+    local similar = {}
+    local word = name:lower():gsub("^%a+%d?:%s*", ""):match("%a+") or ""
+    for _, e in ipairs(find_installed(word, 10)) do similar[#similar + 1] = e.name end
+    error("plugin '" .. name .. "' non trovato." .. (#similar > 0 and (" Simili installati: " .. table.concat(similar, "; ")) or " Usa list_installed_fx per i nomi esatti"), 0)
+  end
+  return idx
+end
+
 function C.add_fx(args)
   local tr = get_track(args.track)
-  local idx = reaper.TrackFX_AddByName(tr, args.fx_name, false, -1)
-  if idx < 0 then error("plugin '" .. tostring(args.fx_name) .. "' non trovato. Usa list_installed_fx per i nomi esatti") end
+  local idx = add_fx_resolved(tr, args.fx_name)
   if args.position ~= nil and args.position ~= idx then
     reaper.TrackFX_CopyToTrack(tr, idx, tr, args.position, true)
     idx = args.position
@@ -610,20 +777,9 @@ end
 function C.render(args) return render(args) end
 
 function C.list_installed_fx(args)
-  if not reaper.EnumInstalledFX then
-    return { unsupported = true, hint = "REAPER troppo vecchio per EnumInstalledFX; prova i plugin Cockos (ReaEQ, ReaComp, ReaXcomp, ReaLimit, ReaVerbate, ReaDelay)" }
-  end
-  local filter = args.filter and tostring(args.filter):lower()
   local out = {}
-  local i = 0
-  while true do
-    local ok, name = reaper.EnumInstalledFX(i)
-    if not ok then break end
-    if not filter or name:lower():find(filter, 1, true) then out[#out + 1] = name end
-    if #out >= (args.limit or 200) then break end
-    i = i + 1
-  end
-  return { fx = out }
+  for _, e in ipairs(find_installed(args.filter, args.limit or 200)) do out[#out + 1] = e.name end
+  return { fx = out, source = reaper.EnumInstalledFX and "EnumInstalledFX" or "scansione cartelle" }
 end
 
 MUTATING.undo = false
@@ -656,6 +812,363 @@ function C.run_lua(args)
   if not chunk then error("errore di sintassi: " .. tostring(cerr)) end
   local ret = chunk()
   return { output = table.concat(output, "\n"), result = ret }
+end
+
+
+---------------------------------------------------------------------------
+-- Piano di mix: tante modifiche in un solo comando (e un solo undo)
+---------------------------------------------------------------------------
+local function clean_err(e)
+  return (tostring(e):gsub("^[^\n]-:%d+: ", ""))
+end
+
+local function norm_fx_name(n)
+  n = tostring(n or ""):lower()
+  n = n:gsub("^%a+%d?i?:%s*", ""):gsub("%s*%b()%s*$", ""):gsub("^%s+", ""):gsub("%s+$", "")
+  return n
+end
+
+local function fx_matches(actual, wanted)
+  local a, w = norm_fx_name(actual), norm_fx_name(wanted)
+  if w == "" then return false end
+  return a == w or a:find(w, 1, true) ~= nil or w:find(a, 1, true) ~= nil
+end
+
+local function apply_params(tr, idx, params)
+  local set = {}
+  for pname, v in pairs(params or {}) do
+    local ok, err = pcall(function()
+      local p = get_param(tr, idx, pname)
+      if type(v) == "table" then
+        reaper.TrackFX_SetParamNormalized(tr, idx, p, math.max(0, math.min(1, tonumber(v.value) or 0)))
+      elseif type(v) == "boolean" then
+        reaper.TrackFX_SetParamNormalized(tr, idx, p, v and 1 or 0)
+      else
+        local num = tonumber(v)
+        if num == nil then error("valore non numerico: " .. tostring(v), 0) end
+        set_param_by_display(tr, idx, p, num)
+      end
+      set[param_name(tr, idx, p)] = formatted(tr, idx, p)
+    end)
+    if not ok then set[tostring(pname)] = "ERRORE: " .. clean_err(err) end
+  end
+  return set
+end
+
+MUTATING.apply_plan = true
+function C.apply_plan(args)
+  local entries = {}
+  for _, e in ipairs(args.tracks or {}) do entries[#entries + 1] = e end
+  if type(args.master) == "table" then
+    args.master.track = "master"
+    entries[#entries + 1] = args.master
+  end
+  local report = {}
+  for _, e in ipairs(entries) do
+    local r = { track = tostring(e.track) }
+    local ok, err = pcall(function()
+      local tr = get_track(e.track)
+      r.track = track_name(tr)
+      if e.volume_db ~= nil then reaper.SetMediaTrackInfo_Value(tr, "D_VOL", db_to_amp(tonumber(e.volume_db))) end
+      if e.pan ~= nil then reaper.SetMediaTrackInfo_Value(tr, "D_PAN", math.max(-1, math.min(1, tonumber(e.pan)))) end
+      if e.mute ~= nil then reaper.SetMediaTrackInfo_Value(tr, "B_MUTE", e.mute and 1 or 0) end
+      for _, rem in ipairs(e.remove_fx or {}) do
+        local okr, fx = pcall(get_fx, tr, rem)
+        if okr then reaper.TrackFX_Delete(tr, fx) end
+      end
+      local used = {}
+      r.fx = {}
+      for _, f in ipairs(e.fx or {}) do
+        local fr = { name = f.name }
+        local okf, errf = pcall(function()
+          local idx
+          if f.index ~= nil then
+            idx = math.floor(tonumber(f.index))
+            if idx < 0 or idx >= reaper.TrackFX_GetCount(tr) then error("fx " .. idx .. " inesistente", 0) end
+          else
+            -- riuso il plugin se c'è già (niente doppioni a ogni giro), altrimenti lo aggiungo
+            for i = 0, reaper.TrackFX_GetCount(tr) - 1 do
+              if not used[i] and fx_matches(fx_name(tr, i), f.name) then idx = i; break end
+            end
+          end
+          if idx == nil then
+            idx = add_fx_resolved(tr, f.name)
+            fr.added = true
+          end
+          used[idx] = true
+          if f.enabled ~= nil then reaper.TrackFX_SetEnabled(tr, idx, f.enabled and true or false) end
+          fr.fx = fx_name(tr, idx)
+          fr.index = idx
+          fr.params = apply_params(tr, idx, f.params)
+        end)
+        if not okf then fr.error = clean_err(errf) end
+        r.fx[#r.fx + 1] = fr
+      end
+      r.volume_db = round(amp_to_db(reaper.GetMediaTrackInfo_Value(tr, "D_VOL")), 2)
+    end)
+    if not ok then r.error = clean_err(err) end
+    report[#report + 1] = r
+  end
+  return { applied = report }
+end
+
+---------------------------------------------------------------------------
+-- Item (le parti audio sulla timeline)
+---------------------------------------------------------------------------
+local function item_info(tr, i, it)
+  local take = reaper.GetActiveTake(it)
+  local info = {
+    index = i,
+    position = round(reaper.GetMediaItemInfo_Value(it, "D_POSITION"), 3),
+    length = round(reaper.GetMediaItemInfo_Value(it, "D_LENGTH"), 3),
+    volume_db = round(amp_to_db(reaper.GetMediaItemInfo_Value(it, "D_VOL")), 2),
+    fade_in = round(reaper.GetMediaItemInfo_Value(it, "D_FADEINLEN"), 3),
+    fade_out = round(reaper.GetMediaItemInfo_Value(it, "D_FADEOUTLEN"), 3),
+    mute = reaper.GetMediaItemInfo_Value(it, "B_MUTE") == 1,
+    takes = reaper.CountTakes(it),
+  }
+  info["end"] = round(info.position + info.length, 3)
+  if take then
+    local _, tname = reaper.GetSetMediaItemTakeInfo_String(take, "P_NAME", "", false)
+    info.take = tname
+    info.take_volume_db = round(amp_to_db(math.abs(reaper.GetMediaItemTakeInfo_Value(take, "D_VOL"))), 2)
+    info.pitch = reaper.GetMediaItemTakeInfo_Value(take, "D_PITCH")
+    info.playrate = reaper.GetMediaItemTakeInfo_Value(take, "D_PLAYRATE")
+    info.midi = reaper.TakeIsMIDI(take)
+  end
+  return info
+end
+
+-- item per indice sulla traccia, oppure quello che contiene il tempo "at" (secondi)
+local function get_item(tr, args)
+  local n = reaper.CountTrackMediaItems(tr)
+  if args.item ~= nil then
+    local i = math.floor(tonumber(args.item) or -1)
+    local it = reaper.GetTrackMediaItem(tr, i)
+    if not it then error("item " .. tostring(args.item) .. " inesistente (la traccia ha " .. n .. " item)") end
+    return it, i
+  end
+  if args.at ~= nil then
+    for i = 0, n - 1 do
+      local it = reaper.GetTrackMediaItem(tr, i)
+      local pos = reaper.GetMediaItemInfo_Value(it, "D_POSITION")
+      local len = reaper.GetMediaItemInfo_Value(it, "D_LENGTH")
+      if args.at >= pos and args.at < pos + len then return it, i end
+    end
+    error("nessun item a " .. args.at .. "s sulla traccia " .. track_name(tr))
+  end
+  error("specifica 'item' (indice) oppure 'at' (secondi)")
+end
+
+function C.list_items(args)
+  local tr = get_track(args.track)
+  local out = {}
+  local n = reaper.CountTrackMediaItems(tr)
+  for i = 0, math.min(n, args.limit or 200) - 1 do
+    out[#out + 1] = item_info(tr, i, reaper.GetTrackMediaItem(tr, i))
+  end
+  return { track = track_name(tr), count = n, items = out }
+end
+
+MUTATING.edit_item = true
+function C.edit_item(args)
+  local tr = get_track(args.track)
+  local it, i = get_item(tr, args)
+  local take = reaper.GetActiveTake(it)
+  if args.volume_db ~= nil then reaper.SetMediaItemInfo_Value(it, "D_VOL", db_to_amp(args.volume_db)) end
+  if args.fade_in ~= nil then reaper.SetMediaItemInfo_Value(it, "D_FADEINLEN", math.max(0, args.fade_in)) end
+  if args.fade_out ~= nil then reaper.SetMediaItemInfo_Value(it, "D_FADEOUTLEN", math.max(0, args.fade_out)) end
+  if args.fade_shape ~= nil then
+    reaper.SetMediaItemInfo_Value(it, "C_FADEINSHAPE", args.fade_shape)
+    reaper.SetMediaItemInfo_Value(it, "C_FADEOUTSHAPE", args.fade_shape)
+  end
+  if args.mute ~= nil then reaper.SetMediaItemInfo_Value(it, "B_MUTE", args.mute and 1 or 0) end
+  if args.position ~= nil then reaper.SetMediaItemInfo_Value(it, "D_POSITION", math.max(0, args.position)) end
+  if args.move_by ~= nil then
+    local pos = reaper.GetMediaItemInfo_Value(it, "D_POSITION")
+    reaper.SetMediaItemInfo_Value(it, "D_POSITION", math.max(0, pos + args.move_by))
+  end
+  if args.length ~= nil then reaper.SetMediaItemInfo_Value(it, "D_LENGTH", math.max(0.001, args.length)) end
+  if args.trim_start ~= nil and args.trim_start ~= 0 then
+    -- accorcia (positivo) o allunga (negativo) l'inizio senza spostare l'audio nel tempo
+    local pos = reaper.GetMediaItemInfo_Value(it, "D_POSITION")
+    local len = reaper.GetMediaItemInfo_Value(it, "D_LENGTH")
+    local d = math.min(args.trim_start, len - 0.001)
+    reaper.SetMediaItemInfo_Value(it, "D_POSITION", pos + d)
+    reaper.SetMediaItemInfo_Value(it, "D_LENGTH", len - d)
+    if take then
+      local offs = reaper.GetMediaItemTakeInfo_Value(take, "D_STARTOFFS")
+      local rate = reaper.GetMediaItemTakeInfo_Value(take, "D_PLAYRATE")
+      reaper.SetMediaItemTakeInfo_Value(take, "D_STARTOFFS", math.max(0, offs + d * rate))
+    end
+  end
+  if take then
+    if args.pitch ~= nil then reaper.SetMediaItemTakeInfo_Value(take, "D_PITCH", args.pitch) end
+    if args.playrate ~= nil then reaper.SetMediaItemTakeInfo_Value(take, "D_PLAYRATE", args.playrate) end
+  end
+  reaper.UpdateItemInProject(it)
+  return item_info(tr, i, it)
+end
+
+MUTATING.split_item = true
+function C.split_item(args)
+  local tr = get_track(args.track)
+  local times = args.times or { args.time }
+  local done = {}
+  table.sort(times, function(a, b) return a > b end) -- dal fondo, così gli indici restano validi
+  for _, t in ipairs(times) do
+    local ok = pcall(function()
+      local it = get_item(tr, { at = t })
+      if reaper.SplitMediaItem(it, t) then done[#done + 1] = t end
+    end)
+    if not ok then done[#done + 1] = { time = t, error = "nessun item a quel tempo" } end
+  end
+  return { track = track_name(tr), splits = done, items = reaper.CountTrackMediaItems(tr) }
+end
+
+MUTATING.delete_item = true
+function C.delete_item(args)
+  local tr = get_track(args.track)
+  local it, i = get_item(tr, args)
+  local info = item_info(tr, i, it)
+  reaper.DeleteTrackMediaItem(tr, it)
+  return { deleted = info }
+end
+
+---------------------------------------------------------------------------
+-- Automazioni (envelope)
+---------------------------------------------------------------------------
+local function with_only_track_selected(tr, fn)
+  local saved = {}
+  for i = 0, reaper.CountSelectedTracks(0) - 1 do saved[#saved + 1] = reaper.GetSelectedTrack(0, i) end
+  reaper.SetOnlyTrackSelected(tr)
+  local ok, res = pcall(fn)
+  reaper.SetOnlyTrackSelected(tr)
+  reaper.SetTrackSelected(tr, false)
+  for _, t in ipairs(saved) do reaper.SetTrackSelected(t, true) end
+  if not ok then error(res, 0) end
+  return res
+end
+
+-- ritorna envelope, kind ("volume" | "fx"), info per la conversione dei valori
+local function get_envelope(tr, args, create)
+  if args.target == "volume" or args.target == nil and args.fx == nil then
+    local env = reaper.GetTrackEnvelopeByChunkName(tr, "<VOLENV2")
+    if not env and create then
+      with_only_track_selected(tr, function() reaper.Main_OnCommand(40406, 0) end) -- mostra envelope volume
+      env = reaper.GetTrackEnvelopeByChunkName(tr, "<VOLENV2")
+    end
+    if not env then error("envelope volume non disponibile su " .. track_name(tr)) end
+    return env, "volume"
+  end
+  local fx = get_fx(tr, args.fx)
+  local p = get_param(tr, fx, args.param)
+  local env = reaper.GetFXEnvelope(tr, fx, p, create and true or false)
+  if not env then error("nessuna automazione per " .. param_name(tr, fx, p)) end
+  local _, minv, maxv = reaper.TrackFX_GetParam(tr, fx, p)
+  return env, "fx", { fx = fx, param = p, min = minv, max = maxv }
+end
+
+local function env_value(env, kind, info, tr, point)
+  if kind == "volume" then
+    local db = point.volume_db or point.value or 0
+    return reaper.ScaleToEnvelopeMode(reaper.GetEnvelopeScalingMode(env), db_to_amp(db))
+  end
+  local norm
+  if point.display ~= nil then norm = find_norm_for_display(tr, info.fx, info.param, tonumber(point.display))
+  else norm = math.max(0, math.min(1, point.value or 0)) end
+  return info.min + norm * (info.max - info.min)
+end
+
+local function describe_point(env, kind, info, tr, time, value)
+  if kind == "volume" then
+    return { time = round(time, 3), volume_db = round(amp_to_db(reaper.ScaleFromEnvelopeMode(reaper.GetEnvelopeScalingMode(env), value)), 2) }
+  end
+  local norm = (info.max ~= info.min) and (value - info.min) / (info.max - info.min) or 0
+  local _, disp = reaper.TrackFX_FormatParamValueNormalized(tr, info.fx, info.param, norm, "")
+  return { time = round(time, 3), value = round(norm, 4), display = disp }
+end
+
+function C.get_envelope(args)
+  local tr = get_track(args.track)
+  local env, kind, info = get_envelope(tr, args, false)
+  local pts = {}
+  local n = reaper.CountEnvelopePoints(env)
+  for i = 0, math.min(n, 300) - 1 do
+    local _, time, value = reaper.GetEnvelopePoint(env, i)
+    pts[#pts + 1] = describe_point(env, kind, info, tr, time, value)
+  end
+  return { track = track_name(tr), kind = kind, count = n, points = pts }
+end
+
+MUTATING.set_envelope = true
+function C.set_envelope(args)
+  local tr = get_track(args.track)
+  local env, kind, info = get_envelope(tr, args, true)
+  local pts = args.points or {}
+  if args.clear then
+    local s, e = args.clear[1] or args.clear.start, args.clear[2] or args.clear["end"]
+    if s and e then reaper.DeleteEnvelopePointRange(env, s - 0.0001, e + 0.0001) end
+  elseif #pts > 0 and args.replace_range ~= false then
+    -- sostituisce i punti esistenti nell'intervallo coperto dai nuovi
+    local s, e = math.huge, -math.huge
+    for _, pt in ipairs(pts) do s = math.min(s, pt.time); e = math.max(e, pt.time) end
+    reaper.DeleteEnvelopePointRange(env, s - 0.0001, e + 0.0001)
+  end
+  local shape = args.shape or 0 -- 0 lineare, 1 a gradino, 2 lento, 5 bezier
+  for _, pt in ipairs(pts) do
+    reaper.InsertEnvelopePoint(env, pt.time, env_value(env, kind, info, tr, pt), pt.shape or shape, 0, false, true)
+  end
+  reaper.Envelope_SortPoints(env)
+  return { track = track_name(tr), kind = kind, points_added = #pts, total_points = reaper.CountEnvelopePoints(env) }
+end
+
+---------------------------------------------------------------------------
+-- Sidechain: la traccia "source" pilota il compressore sulla traccia "target"
+---------------------------------------------------------------------------
+MUTATING.setup_sidechain = true
+function C.setup_sidechain(args)
+  local src = get_track(args.source)
+  local dst = get_track(args.target)
+  if src == dst then error("sorgente e destinazione coincidono") end
+  if reaper.GetMediaTrackInfo_Value(dst, "I_NCHAN") < 4 then reaper.SetMediaTrackInfo_Value(dst, "I_NCHAN", 4) end
+  local send = reaper.CreateTrackSend(src, dst)
+  if send < 0 then error("impossibile creare il send") end
+  reaper.SetTrackSendInfo_Value(src, 0, send, "I_SRCCHAN", 0)   -- canali 1/2 della sorgente
+  reaper.SetTrackSendInfo_Value(src, 0, send, "I_DSTCHAN", 2)   -- verso i canali 3/4 della destinazione
+  reaper.SetTrackSendInfo_Value(src, 0, send, "D_VOL", db_to_amp(args.send_db or 0))
+
+  local fx
+  if args.fx ~= nil then fx = get_fx(dst, args.fx)
+  else
+    local ok, found = pcall(get_fx, dst, "ReaComp")
+    fx = ok and found or reaper.TrackFX_AddByName(dst, "ReaComp", false, -1)
+    if fx < 0 then error("ReaComp non trovato") end
+  end
+  -- ingressi 3/4 del plugin = canali 3/4 della traccia (sidechain)
+  reaper.TrackFX_SetPinMappings(dst, fx, 0, 2, 4, 0)
+  reaper.TrackFX_SetPinMappings(dst, fx, 0, 3, 8, 0)
+
+  -- se il plugin ha un parametro "detector input", lo porto sull'ingresso ausiliario
+  local detector
+  for p = 0, reaper.TrackFX_GetNumParams(dst, fx) - 1 do
+    if param_name(dst, fx, p):lower():find("detector") then
+      for step = 0, 100 do
+        local x = step / 100
+        local ok, s = reaper.TrackFX_FormatParamValueNormalized(dst, fx, p, x, "")
+        if ok and s:lower():find("aux") then
+          reaper.TrackFX_SetParamNormalized(dst, fx, p, x)
+          detector = formatted(dst, fx, p)
+          break
+        end
+      end
+      break
+    end
+  end
+  return {
+    source = track_name(src), target = track_name(dst), send_index = send, fx_index = fx, fx = fx_name(dst, fx),
+    detector = detector or "non trovato: imposta l'ingresso sidechain del plugin (canali 3/4) a mano o con set_fx_params",
+  }
 end
 
 ---------------------------------------------------------------------------
@@ -725,11 +1238,17 @@ local function poll()
   end
 end
 
+local function project_path()
+  local ok, _, fn = pcall(reaper.EnumProjects, -1)
+  if ok and fn then return fn end
+  return ""
+end
+
 local function heartbeat(state)
   local _, proj_name = reaper.GetProjectName(0, "")
   write_atomic(IPC_DIR .. "heartbeat.json", json.encode({
     state = state, bridge = VERSION, reaper = reaper.GetAppVersion(),
-    project = proj_name, time = os.time(),
+    project = proj_name, project_path = project_path(), time = os.time(),
   }))
 end
 
