@@ -3,7 +3,7 @@
 -- Resta in esecuzione in background e scambia comandi JSON con il server Node
 -- tramite la cartella "ipc" accanto allo script.
 
-local VERSION = "0.3.1"
+local VERSION = "0.4.0"
 
 ---------------------------------------------------------------------------
 -- Paths
@@ -447,6 +447,8 @@ local function render(args)
   reaper.GetSetProjectInfo(0, "RENDER_NORMALIZE", 0, true)
   reaper.GetSetProjectInfo(0, "RENDER_TAILFLAG", 0, true)
 
+  -- se REAPER ha messo i file offline (finestra non attiva), li rimetto online: altrimenti il render è muto
+  reaper.Main_OnCommand(40101, 0) -- Item: Set all media online
   local ok, e = pcall(reaper.Main_OnCommand, 42230, 0) -- Render project, most recent settings, auto-close
 
   -- ripristino
@@ -814,6 +816,130 @@ function C.run_lua(args)
   return { output = table.concat(output, "\n"), result = ret }
 end
 
+
+
+---------------------------------------------------------------------------
+-- Stato originale del mixer (prima del copilot): volumi, pan, mute e catene FX.
+-- Salvato dentro il progetto (ProjExtState), quindi resta anche dopo aver chiuso REAPER.
+-- L'audio (item) non viene mai toccato: della traccia sostituisco solo il blocco <FXCHAIN>.
+---------------------------------------------------------------------------
+local EXT_SECTION = "reaper_copilot"
+
+local function split_lines(s)
+  local t = {}
+  for line in (s .. "\n"):gmatch("(.-)\r?\n") do t[#t + 1] = line end
+  return t
+end
+
+-- righe [i, j] del blocco <TAG ...> ... > (gestisce i blocchi annidati)
+local function find_block(lines, tag)
+  for i, line in ipairs(lines) do
+    if line:match("^%s*<" .. tag .. "[%s>]") or line:match("^%s*<" .. tag .. "$") then
+      local depth = 0
+      for j = i, #lines do
+        if lines[j]:match("^%s*<") then depth = depth + 1 end
+        if lines[j]:match("^%s*>%s*$") then
+          depth = depth - 1
+          if depth == 0 then return i, j end
+        end
+      end
+    end
+  end
+  return nil
+end
+
+local function fxchain_of(tr)
+  local ok, chunk = reaper.GetTrackStateChunk(tr, "", false)
+  if not ok then return nil end
+  local lines = split_lines(chunk)
+  local i, j = find_block(lines, "FXCHAIN")
+  if not i then return "" end
+  return table.concat(lines, "\n", i, j)
+end
+
+local function set_fxchain(tr, block)
+  local ok, chunk = reaper.GetTrackStateChunk(tr, "", false)
+  if not ok then error("chunk della traccia non leggibile", 0) end
+  local lines = split_lines(chunk)
+  while #lines > 0 and lines[#lines] == "" do table.remove(lines) end
+  local i, j = find_block(lines, "FXCHAIN")
+  local new = {}
+  if i then
+    for k = 1, i - 1 do new[#new + 1] = lines[k] end
+    if block ~= "" then for _, l in ipairs(split_lines(block)) do new[#new + 1] = l end end
+    for k = j + 1, #lines do new[#new + 1] = lines[k] end
+  else
+    if block == "" then return end
+    -- nessuna catena attuale: la inserisco prima del primo item o della chiusura della traccia
+    local at = #lines
+    for k, l in ipairs(lines) do if l:match("^%s*<ITEM") then at = k; break end end
+    for k = 1, at - 1 do new[#new + 1] = lines[k] end
+    for _, l in ipairs(split_lines(block)) do new[#new + 1] = l end
+    for k = at, #lines do new[#new + 1] = lines[k] end
+  end
+  if not reaper.SetTrackStateChunk(tr, table.concat(new, "\n"), false) then error("impossibile ripristinare la catena FX", 0) end
+end
+
+local function all_tracks_with_master()
+  local list = { reaper.GetMasterTrack(0) }
+  for i = 0, reaper.CountTracks(0) - 1 do list[#list + 1] = reaper.GetTrack(0, i) end
+  return list
+end
+
+local function read_baseline()
+  local ok, raw = reaper.GetProjExtState(0, EXT_SECTION, "baseline")
+  if not ok or ok == 0 or raw == "" then return nil end
+  local okd, data = pcall(json.decode, raw)
+  return okd and data or nil
+end
+
+function C.baseline_status()
+  local b = read_baseline()
+  if not b then return { exists = false } end
+  return { exists = true, saved_at = b.saved_at, tracks = #(b.tracks or {}) }
+end
+
+function C.save_baseline(args)
+  if read_baseline() and not args.force then return { exists = true, saved = false } end
+  local tracks = {}
+  for _, tr in ipairs(all_tracks_with_master()) do
+    tracks[#tracks + 1] = {
+      guid = reaper.GetTrackGUID(tr),
+      name = track_name(tr),
+      vol = reaper.GetMediaTrackInfo_Value(tr, "D_VOL"),
+      pan = reaper.GetMediaTrackInfo_Value(tr, "D_PAN"),
+      mute = reaper.GetMediaTrackInfo_Value(tr, "B_MUTE"),
+      fxchain = fxchain_of(tr) or "",
+    }
+  end
+  reaper.SetProjExtState(0, EXT_SECTION, "baseline", json.encode({ saved_at = os.date("%Y-%m-%d %H:%M"), tracks = tracks }))
+  reaper.MarkProjectDirty(0)
+  return { saved = true, tracks = #tracks }
+end
+
+MUTATING.restore_baseline = true
+function C.restore_baseline()
+  local b = read_baseline()
+  if not b then error("nessuno stato originale salvato per questo progetto", 0) end
+  local by_guid = {}
+  for _, t in ipairs(b.tracks or {}) do by_guid[t.guid] = t end
+  local restored, errors, extra = 0, {}, {}
+  for _, tr in ipairs(all_tracks_with_master()) do
+    local t = by_guid[reaper.GetTrackGUID(tr)]
+    if t then
+      local ok, err = pcall(function()
+        reaper.SetMediaTrackInfo_Value(tr, "D_VOL", t.vol)
+        reaper.SetMediaTrackInfo_Value(tr, "D_PAN", t.pan)
+        reaper.SetMediaTrackInfo_Value(tr, "B_MUTE", t.mute)
+        set_fxchain(tr, t.fxchain or "")
+      end)
+      if ok then restored = restored + 1 else errors[#errors + 1] = track_name(tr) .. ": " .. tostring(err) end
+    else
+      extra[#extra + 1] = track_name(tr)
+    end
+  end
+  return { restored = restored, saved_at = b.saved_at, errors = errors, tracks_not_in_original = extra }
+end
 
 ---------------------------------------------------------------------------
 -- Piano di mix: tante modifiche in un solo comando (e un solo undo)

@@ -6,23 +6,20 @@ const config = require('./config');
 const file = path.join(config.dataDir, 'usage.jsonl');
 
 // token "fatturabili" equivalenti: le letture dalla cache costano molto meno
-function billedInput(provider, u) {
+// (input_tokens esclude la cache; scrittura 5 min = 1.25x, 1 ora = 2x; lettura ~0.1x)
+function billedInput(u) {
   const input = u.input_tokens || 0;
   const read = u.cache_read_input_tokens || 0;
   const write = u.cache_creation_input_tokens || 0;
-  if (provider === 'anthropic') {
-    // input_tokens esclude la cache; scrittura 5 min = 1.25x, 1 ora = 2x; lettura ~0.1x (0.05x su Sonnet/Opus 5.5)
-    const cc = u.cache_creation || {};
-    const w1h = cc.ephemeral_1h_input_tokens || 0;
-    const w5m = cc.ephemeral_5m_input_tokens != null ? cc.ephemeral_5m_input_tokens : write - w1h;
-    return input + w5m * 1.25 + w1h * 2 + read * 0.1;
-  }
-  return input - read + read * 0.5; // OpenAI-compatibili: prompt_tokens include la cache (sconto variabile)
+  const cc = u.cache_creation || {};
+  const w1h = cc.ephemeral_1h_input_tokens || 0;
+  const w5m = cc.ephemeral_5m_input_tokens != null ? cc.ephemeral_5m_input_tokens : write - w1h;
+  return input + w5m * 1.25 + w1h * 2 + read * 0.1;
 }
 
 function cost(tier, u) {
   if (!tier.price) return null;
-  const c = (billedInput(tier.provider, u) * tier.price.input + (u.output_tokens || 0) * tier.price.output) / 1e6;
+  const c = (billedInput(u) * tier.price.input + (u.output_tokens || 0) * tier.price.output) / 1e6;
   return Math.round(c * 1e6) / 1e6;
 }
 

@@ -56,15 +56,36 @@ async function render(opts, signal) {
   }
 }
 
-function summarize(a) {
-  return {
+function summarize(a, { withLra = false } = {}) {
+  const out = {
     lufs: a.loudness.integrated_lufs,
     peak_db: a.loudness.sample_peak_dbfs,
     crest_db: a.loudness.crest_db,
-    lra: a.loudness.lra_lu,
+    plr_db: a.loudness.plr_db,
     tonal: a.tonal_balance_groups_db,
     width: a.stereo.side_minus_mid_db,
   };
+  // l'LRA su un tratto breve non è affidabile: lo riporto solo su tratti lunghi
+  if (withLra) out.lra = a.loudness.lra_lu;
+  return out;
+}
+
+// tratto della reference con la stessa durata e la loudness più alta (di solito il ritornello)
+function loudestWindow(fullAnalysis, len) {
+  const curve = fullAnalysis.loudness_over_time_lufs || [];
+  const dur = fullAnalysis.duration_sec || 0;
+  if (!curve.length || dur <= len + 2) return { start: 0, end: Math.max(1, Math.min(dur, len)) };
+  const step = dur / curve.length;
+  const n = Math.max(1, Math.round(len / step));
+  let best = 0;
+  let bestScore = -Infinity;
+  for (let i = 0; i + n <= curve.length; i++) {
+    const w = curve.slice(i, i + n);
+    const score = w.reduce((a, b) => a + b, 0) / w.length;
+    if (score > bestScore) { bestScore = score; best = i; }
+  }
+  const start = Math.round(best * step);
+  return { start, end: Math.min(dur, start + len) };
 }
 
 function diffSummary(mine, ref) {
@@ -104,8 +125,16 @@ async function mixReport(input = {}, signal) {
   // reference
   let ref = null;
   let refStems = null;
+  let refWin = null;
   if (input.reference) {
-    ref = await references.analyze(input.reference, { start_sec: input.reference_start_sec, end_sec: input.reference_end_sec }, signal);
+    if (input.reference_start_sec != null || input.reference_end_sec != null) {
+      refWin = { start: input.reference_start_sec || 0, end: input.reference_end_sec };
+    } else {
+      // stessa durata del tratto del tuo mix, nella parte più forte della reference
+      const full = await references.analyze(input.reference, {}, signal);
+      refWin = loudestWindow(full.analysis, range.end - range.start);
+    }
+    ref = await references.analyze(input.reference, { start_sec: refWin.start, end_sec: refWin.end }, signal);
     try {
       const r = references.find(input.reference);
       if (config.separator.mode !== 'off' && input.stems !== false) {
@@ -122,15 +151,23 @@ async function mixReport(input = {}, signal) {
   const out = {
     range: { start: r1(range.start), end: r1(range.end) },
     reference: ref ? ref.reference : null,
-    master: { ...summarize(masterA), fx: (project.master.fx || []).map((f) => f.name.replace(/^(VST3?i?|JS|AU|CLAP): /, '').replace(/ \([^)]*\)$/, '')) },
+    reference_range: refWin ? { start: r1(refWin.start), end: refWin.end != null ? r1(refWin.end) : null } : undefined,
+    master: { ...summarize(masterA, { withLra: range.end - range.start >= 60 }), fx: (project.master.fx || []).map((f) => f.name.replace(/^(VST3?i?|JS|AU|CLAP): /, '').replace(/ \([^)]*\)$/, '')) },
     groups: [],
   };
+  const warnings = [];
   if (ref) {
     out.master.vs_ref = {
       loudness_lu: r1(ref.analysis.loudness.integrated_lufs - masterA.loudness.integrated_lufs),
       ...diffSummary(masterA, ref.analysis),
     };
+    const crestGap = masterA.loudness.crest_db - ref.analysis.loudness.crest_db;
+    if (crestGap < -2) warnings.push(`dinamica più schiacciata della reference (crest ${masterA.loudness.crest_db} vs ${ref.analysis.loudness.crest_db} dB): alleggerisci limiter/compressione del master prima di cercare altra loudness`);
+    if (masterA.loudness.integrated_lufs > ref.analysis.loudness.integrated_lufs + 0.5) warnings.push('il mix è più forte della reference: abbassa il limiter, non serve altra loudness');
+  } else if (masterA.loudness.crest_db < 7) {
+    warnings.push(`crest del master molto basso (${masterA.loudness.crest_db} dB): mix probabilmente schiacciato`);
   }
+  if (masterA.loudness.sample_peak_dbfs > -0.3) warnings.push(`picchi del master a ${masterA.loudness.sample_peak_dbfs} dBFS: rischio clipping, ceiling del limiter a -1 dB`);
 
   // gruppi di strumenti
   const groups = {};
@@ -154,7 +191,7 @@ async function mixReport(input = {}, signal) {
     const stemName = refStems && (refStems[g] ? g : (g === 'guitar' || g === 'piano') && refStems.other ? 'other' : null);
     if (ref && stemName) {
       try {
-        const rs = await references.analyze(input.reference, { stem: stemName, start_sec: input.reference_start_sec, end_sec: input.reference_end_sec }, signal);
+        const rs = await references.analyze(input.reference, { stem: stemName, start_sec: refWin.start, end_sec: refWin.end }, signal);
         const refRel = rs.analysis.loudness.integrated_lufs - ref.analysis.loudness.integrated_lufs;
         entry.vs_ref = {
           stem: stemName,
@@ -168,6 +205,7 @@ async function mixReport(input = {}, signal) {
     out.groups.push(entry);
   }
 
+  if (warnings.length) out.warnings = warnings;
   out.legend = 'level_vs_mix_db = loudness del gruppo rispetto al mix. vs_ref: valori = reference meno il tuo; balance_db positivo = alza il gruppo; tonal positivo = alla reference c\'è più energia in quella banda; eq = mosse suggerite (già al 70%).';
   if (notes.length) out.notes = notes;
   return out;

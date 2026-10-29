@@ -33,24 +33,25 @@ function checkFfmpeg() {
   return ffmpegOk;
 }
 
+function tierStatus(t) {
+  return {
+    label: t.label,
+    model: config.tierModel(t),
+    envModel: t.envModel,
+    presets: t.presets,
+    price: t.price,
+  };
+}
+
 app.get('/api/status', async (req, res) => {
   res.json({
     reaper: reaper.status(),
     project: store.currentProject(),
-    tiers: Object.fromEntries(Object.entries(config.tiers).map(([name, t]) => [name, {
-      provider: t.provider,
-      baseUrl: t.provider === 'openai' ? t.baseUrl : undefined,
-      model: config.tierModel(t),
-      envModel: t.envModel,
-      presets: t.presets,
-      priced: Boolean(t.price),
-      hasKey: Boolean(config.tierKey(t)) || !config.keyRequired(t),
-      keyFromEnv: Boolean(t.envKey) || !config.keyRequired(t),
-    }])),
+    tiers: Object.fromEntries(['strong', 'fast'].map((name) => [name, tierStatus(config.tiers[name])])),
     routing: config.routingMode(),
     routingEnv: config.routing.mode,
-    hasApiKey: Boolean(config.tierKey(config.tiers.strong)) || !config.keyRequired(config.tiers.strong),
-    apiKeyFromEnv: Boolean(config.tiers.strong.envKey) || !config.keyRequired(config.tiers.strong),
+    hasApiKey: Boolean(config.tierKey()),
+    keyHint: config.keyHint(),
     allowLua: Boolean(config.settings.allowLua),
     ffmpeg: checkFfmpeg(),
     separator: await separation.status(),
@@ -58,10 +59,25 @@ app.get('/api/status', async (req, res) => {
   });
 });
 
+// chiave API di Anthropic: la verifico e la salvo nel .env (resta solo su questo PC)
+app.post('/api/setup/key', async (req, res) => {
+  const key = String((req.body && req.body.key) || '').trim().replace(/^["']|["']$/g, '');
+  if (!/^sk-ant-[A-Za-z0-9_-]{20,}$/.test(key)) {
+    return res.status(400).json({ ok: false, error: 'Non sembra una chiave Anthropic: deve iniziare con sk-ant- (copiala intera dalla console).' });
+  }
+  const check = await require('./llm').testKey(key);
+  if (!check.ok) return res.status(400).json(check);
+  try {
+    config.saveApiKey(key);
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: `Chiave valida, ma non riesco a scrivere il file .env: ${e.message}` });
+  }
+  res.json({ ok: true, keyHint: config.keyHint() });
+});
+
 app.post('/api/settings', (req, res) => {
   const patch = {};
   if (typeof req.body.allowLua === 'boolean') patch.allowLua = req.body.allowLua;
-  if (typeof req.body.apiKey === 'string') patch.apiKey = req.body.apiKey.trim();
   if (Object.keys(patch).length) config.saveSettings(patch);
   // il modello scelto dalla UI vale fino al riavvio; il default resta LLM_MODEL nel .env
   for (const name of ['strong', 'fast']) {
@@ -92,6 +108,7 @@ app.get('/api/chat', (req, res) => res.json(chatPayload()));
 app.post('/api/chat', async (req, res) => {
   const { message } = req.body || {};
   if (!message || !String(message).trim()) return res.status(400).json({ error: 'messaggio vuoto' });
+  if (!config.tierKey()) return res.status(400).json({ error: 'Manca la chiave API di Anthropic: inseriscila nella schermata iniziale.' });
   const project = store.currentProject();
   const chat = store.load(project.key, project);
   if (running.has(project.key)) return res.status(409).json({ error: 'sto ancora lavorando alla richiesta precedente' });
@@ -211,8 +228,9 @@ app.listen(config.port, '127.0.0.1', () => {
   console.log(`[copilot] server su http://localhost:${config.port}`);
   console.log(`[copilot] cartella IPC: ${config.ipcDir}`);
   for (const [name, t] of Object.entries(config.tiers)) {
-    console.log(`[copilot] modello ${name === 'strong' ? 'forte ' : 'veloce'}: ${t.provider} · ${config.tierModel(t) || '(non impostato)'}${t.provider === 'openai' ? ` · ${t.baseUrl}` : ''}`);
+    console.log(`[copilot] modello ${name === 'strong' ? 'esperto' : 'veloce '}: ${config.tierModel(t)}`);
   }
+  console.log(config.tierKey() ? `[copilot] chiave Anthropic: ${config.keyHint()}` : '[copilot] chiave Anthropic mancante: apri la chat (http://localhost:3000) e inseriscila');
   console.log(`[copilot] routing: ${config.routingMode()}`);
   console.log(`[copilot] separazione stem: ${config.separator.mode} (${config.separator.model})`);
   separation.init();

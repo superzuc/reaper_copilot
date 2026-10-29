@@ -34,15 +34,19 @@ AUTOMATION, SIDECHAIN, EDITING
 - Item editing (list_items, edit_item, split_item, delete_item): clip gain (edit_item volume_db) to even out a take before compression, fades to remove clicks at edits (5-20 ms), trimming silence/noise at the start/end of items, cutting out a section (split at both edges, then delete the middle item), nudging timing (move_by in seconds, small values). Item indices change after splits/deletes: re-run list_items. Destructive edits (deleting parts, moving audio in time) only when the user asks for them.
 
 FAST WORKFLOW FOR MIXING (default for any mix / reference / "make it sound like" request)
-1. mix_report (with the reference if there is one): ONE call gives you master + every instrument group, levels vs mix, tone, dynamics, current plugins, and the comparison with the reference and its stems.
-2. apply_mix_plan: decide everything and apply it in ONE call — per-track volume, EQ/compression/saturation with real-world values, master chain. Re-running it reuses existing plugins (no duplicates), so it's also how you correct.
+0. If the user asks to redo / start over / "rifai il mix", call restore_baseline FIRST and mix from the original state. Never stack a new mix on top of a previous one unless the user asks to refine it.
+1. mix_report (with the reference if there is one): ONE call gives you master + every instrument group, levels vs mix, tone, dynamics, current plugins, and the comparison with the reference and its stems on an equivalent section.
+2. apply_mix_plan: decide everything and apply it in ONE call — per-track volume, EQ/compression/saturation with real-world values, master chain. Re-running it reuses existing plugins (no duplicates), so it's also how you correct. Remove processing that hurts (remove_fx) instead of compensating it with more processing.
 3. mix_report again on the same range to verify.
-4. At most one more apply_mix_plan to correct, then update_notes and a short report (before → after on the key numbers).
+4. Up to 3 correction rounds (apply_mix_plan → mix_report) while the report still shows meaningful deviations (tonal groups > ~1.5 dB, group balance > ~1.5 dB, loudness > ~1 LU) AND the last round actually improved things. Stop when a round doesn't improve. Then update_notes and a short report (before → after on the key numbers).
+Order of priorities: 1) balance between instruments, 2) tone of each instrument, 3) master tone, 4) dynamics/punch, 5) loudness LAST.
+DYNAMICS GUARDRAIL: never trade dynamics for loudness. Keep the master crest factor within ~2 dB of the reference; if mix_report shows warnings about squashed dynamics, back off the limiter/compression before anything else. A limiter should rarely take more than ~3-4 dB of gain reduction; it's fine to end up 1-2 LU quieter than the reference rather than crushing the mix.
 Use the granular tools (get_fx_params, set_fx_params, render_and_analyze…) only for targeted fixes or when the user asks for something specific. If a parameter name in the plan is wrong, the result tells you: fix it with get_fx_params (filter) only for that plugin.
 Typical ReaEQ params: "Freq-Low Shelf", "Gain-Low Shelf", "Freq-Band 2", "Gain-Band 2", "Q-Band 2", "Freq-Band 3", "Gain-Band 3", "Freq-High Shelf", "Gain-High Shelf". ReaComp: "Threshold" (dB), "Ratio", "Attack" (ms), "Release" (ms), "Pre-comp", "Wet", "Dry". ReaLimit: "Threshold", "Ceiling" (dB). Check with get_fx_params if a name is rejected.
 
 MEMORY
 - The MEMORY block (after these instructions) holds persistent notes: the user's preferences and this project's notes. Use them: don't ask again for things already noted, and respect stated tastes.
+- Project notes are HISTORY, possibly written by another model ("scritte da …"): use them for context (tracks, reference, what the user liked or rejected) but re-evaluate previous settings critically; don't copy them, especially when redoing a mix.
 - When the user states a lasting preference (taste, loudness target, habits, plugins they like/hate) → update_notes scope "user".
 - At the end of a request where you made real mix decisions on this project → update_notes scope "project" with the full rewritten notes: per-track chain and key settings, levels, reference used, what the user liked or rejected, open to-dos. Concise bullets, no duplicates, max ~1500 characters. Put this call together with your last other tool calls, not in a separate step when avoidable. Don't save trivial or temporary things.
 
@@ -308,6 +312,16 @@ const TOOLS = [
     input_schema: { type: 'object', properties: { source: trackSchema, target: trackSchema, fx: fxSchema, send_db: { type: 'number' } }, required: ['source', 'target'] },
   },
   {
+    name: 'restore_baseline',
+    description: 'Riporta il mixer allo STATO ORIGINALE salvato prima del primo intervento del copilot su questo progetto: volumi, pan, mute e catene di effetti di tutte le tracce e del master (l\'audio non viene toccato). Usalo quando l\'utente chiede di rifare il mix da zero, ricominciare, o confrontare con l\'originale.',
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'set_baseline',
+    description: 'Salva lo stato attuale del mixer come nuovo "originale" (sovrascrive quello precedente). Solo se l\'utente lo chiede esplicitamente (es. "questo è il nuovo punto di partenza").',
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
     name: 'update_notes',
     description: 'Aggiorna la memoria persistente. scope "project": note di questo progetto (scelte di mix, catene per traccia, reference, cosa è piaciuto o no). scope "user": preferenze dell\'utente valide per tutti i progetti. content = testo COMPLETO aggiornato (sostituisce il precedente), elenco puntato conciso, max ~1500 caratteri.',
     input_schema: { type: 'object', properties: { scope: { type: 'string', enum: ['project', 'user'] }, content: { type: 'string' } }, required: ['scope', 'content'] },
@@ -425,9 +439,16 @@ async function execTool(name, input, signal, ctx = {}) {
   switch (name) {
     case 'update_notes': {
       if (input.scope === 'user') store.writePrefs(input.content);
-      else if (ctx.session) store.setNotes(ctx.session, input.content);
+      else if (ctx.session) {
+        // le note del progetto sono "firmate": chi le ha scritte e quando
+        const body = String(input.content || '').replace(/^\(scritte da [^)]*\)\s*/i, '');
+        const stamp = new Date().toISOString().slice(0, 16).replace('T', ' ');
+        store.setNotes(ctx.session, `(scritte da ${ctx.modelLabel || 'copilot'}, ${stamp})\n${body}`);
+      }
       return { ok: true, scope: input.scope, chars: String(input.content || '').length };
     }
+    case 'restore_baseline': return reaper.send('restore_baseline', {}, { signal, timeoutMs: 60000 });
+    case 'set_baseline': return reaper.send('save_baseline', { force: true }, { signal });
     case 'get_project': return compactProject(await reaper.send('get_project', {}, { signal }));
     case 'mix_report': return mixReport(input, signal);
     case 'apply_mix_plan': return reaper.send('apply_plan', input, { signal, timeoutMs: 120000 });
@@ -500,8 +521,7 @@ function condenseHistory(messages) {
       parts.push(`[azioni eseguite: ${shown}${turn.actions.length > 25 ? `; …altre ${turn.actions.length - 25}` : ''}]`);
     }
     parts.push(turn.answer || '(nessuna risposta finale: richiesta interrotta)');
-    // il ragionamento finale resta solo per i provider che lo richiedono indietro (DeepSeek);
-    // per gli altri modelli viene tolto in buildMessages
+    // eventuale ragionamento finale: buildMessages lo toglie se il modello non è lo stesso
     const content = [...(turn.reasoning || []), { type: 'text', text: parts.join('\n') }];
     const msg = { role: 'assistant', content };
     if (turn.model) msg._model = turn.model;
@@ -567,10 +587,11 @@ const ESCALATE_TOOL = {
 };
 
 const ANALYSIS_TOOLS = new Set(['render_and_analyze', 'separate_reference', 'analyze_reference', 'mix_report']);
-const READ_ONLY_TOOLS = new Set([...ANALYSIS_TOOLS, 'get_project', 'get_fx_params', 'get_fx_named_config', 'list_installed_fx', 'list_references', 'set_time_selection', 'list_items', 'get_envelope', 'update_notes']);
+const READ_ONLY_TOOLS = new Set([...ANALYSIS_TOOLS, 'get_project', 'get_fx_params', 'get_fx_named_config', 'list_installed_fx', 'list_references', 'set_time_selection', 'list_items', 'get_envelope', 'update_notes', 'set_baseline']);
 const FAST_MAX_STEPS = Number(process.env.FAST_MAX_STEPS || 8);
-const STRONG_BUMP_STEPS = Number(process.env.STRONG_BUMP_STEPS || 10);
-const STRONG_HINT = /\b(mixa\w*|missa\w*|mixare|remix\w*|mastering|masterizz\w*|sistem\w*|miglior\w*|corregg\w*|aggiust\w*|reference|referenc\w*|riferiment\w*|stile|match\w*|bilanc\w*|equilibr\w*|catena|chain|impastat\w*|fango\w*|caldo|brillant\w*|corpo|pulit\w*|profession\w*|timbr\w*|automa\w*|sidechain|side-chain|ducking|pomp\w*)\b|\bsuon\w* (come|da|alla|al)\b|\bsounds? like\b|\ba\s+-?\d+(\.\d+)?\s*lufs|\bcome (i|il|la|lo|le|gli|quell\w*|nei|nel|nella) /i;
+// 0 = mai per lavoro lungo (cambiare sforzo a metà turno azzera la cache di Anthropic)
+const STRONG_BUMP_STEPS = Number(process.env.STRONG_BUMP_STEPS || 0);
+const STRONG_HINT = /\b(mixa\w*|missa\w*|mixare|remix\w*|mastering|masterizz\w*|sistem\w*|miglior\w*|corregg\w*|aggiust\w*|reference|referenc\w*|riferiment\w*|stile|match\w*|bilanc\w*|equilibr\w*|catena|chain|impastat\w*|fango\w*|caldo|brillant\w*|corpo|pulit\w*|profession\w*|timbr\w*|automa\w*|sidechain|side-chain|ducking|pomp\w*|rifa\w*|ricominc\w*)\b|\bda zero\b|\bsuon\w* (come|da|alla|al)\b|\bsounds? like\b|\ba\s+-?\d+(\.\d+)?\s*lufs|\bcome (i|il|la|lo|le|gli|quell\w*|nei|nel|nella) /i;
 // domande di sola analisi: il veloce può renderizzare e misurare, ma non modifica il progetto
 const ANALYSIS_HINT = /\b(analizz\w*|analisi|controll\w*|dimmi|valut\w*|check|lufs|loudness|picc?h?\w*|misur\w*|com'?è|come suona|cosa non va|cosa ne pensi)\b/i;
 
@@ -785,7 +806,12 @@ async function run(session, userText, emit, signal) {
         continue;
       }
       try {
-        const out = await execTool(block.name, block.input || {}, signal, { session });
+        // prima modifica al progetto in questa sessione: salvo lo stato originale (se non c'è già)
+        if (!READ_ONLY_TOOLS.has(block.name) && !['restore_baseline', 'set_baseline'].includes(block.name) && !session.baselineChecked) {
+          session.baselineChecked = true;
+          try { await reaper.send('save_baseline', {}, { signal }); } catch (_) { /* best effort */ }
+        }
+        const out = await execTool(block.name, block.input || {}, signal, { session, modelLabel: config.tiers[tierName].label || config.tierModel(config.tiers[tierName]) });
         const text = JSON.stringify(out ?? { ok: true });
         results.push({ type: 'tool_result', tool_use_id: block.id, content: text.length > 40000 ? text.slice(0, 40000) + '…' : text });
         emit({ type: 'tool_result', id: block.id, ok: true, preview: preview(out ?? 'ok') });
@@ -805,7 +831,7 @@ async function run(session, userText, emit, signal) {
     } else {
       strongSteps++;
       // più sforzo una volta sola, e solo su segnali oggettivi
-      if (!bumped && (errorStreak >= 2 || strongSteps === STRONG_BUMP_STEPS) && effort !== nextEffort(effort)) {
+      if (!bumped && (errorStreak >= 2 || (STRONG_BUMP_STEPS > 0 && strongSteps === STRONG_BUMP_STEPS)) && effort !== nextEffort(effort)) {
         bumped = true;
         effort = nextEffort(effort);
         announce(errorStreak >= 2 ? 'errori ripetuti: più sforzo' : 'lavoro lungo: più sforzo');

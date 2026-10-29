@@ -11,19 +11,22 @@ fs.mkdirSync(dataDir, { recursive: true });
 const settingsFile = path.join(dataDir, 'settings.json');
 
 // ---------------------------------------------------------------------------
-// LLM a due livelli, tutto da .env
-//   forte  (mix, analisi, reference): LLM_PROVIDER, LLM_API_KEY, LLM_MODEL, LLM_BASE_URL
-//   veloce (comandi semplici):        LLM_FAST_PROVIDER, LLM_FAST_API_KEY, LLM_FAST_MODEL, LLM_FAST_BASE_URL
-//   (i LLM_FAST_* non impostati ereditano dal modello forte, tranne il nome del modello)
+// Modelli Claude (Anthropic), a due livelli. Serve solo ANTHROPIC_API_KEY nel .env:
+// al primo avvio la UI la chiede e la scrive lei (vedi saveApiKey).
+//   esperto (mix, analisi, reference): LLM_MODEL       default claude-sonnet-5-5
+//   veloce  (comandi semplici):        LLM_FAST_MODEL  default claude-haiku-5-5
 //   ROUTING = auto | strong | fast
-//   provider: anthropic | openai (= qualsiasi API compatibile OpenAI: OpenRouter, OpenAI,
-//   Gemini, DeepSeek, Groq, Ollama…)
 // ---------------------------------------------------------------------------
 const ANTHROPIC_PRESETS = [
   { id: 'claude-opus-5-5', label: 'Opus 5.5 (il migliore, costoso)' },
   { id: 'claude-sonnet-5-5', label: 'Sonnet 5.5 (equilibrato)' },
   { id: 'claude-haiku-5-5', label: 'Haiku 5.5 (economico)' },
 ];
+// prezzi di listino in USD per milione di token (input, output), per la stima dei costi
+const KNOWN_PRICES = {
+  'claude-sonnet-5-5': { input: 2, output: 10 },
+  'claude-haiku-5-5': { input: 0.1, output: 0.5 },
+};
 
 function parsePrice(v) {
   if (!v) return null;
@@ -31,34 +34,51 @@ function parsePrice(v) {
   return Number.isFinite(inp) && Number.isFinite(out) ? { input: inp, output: out } : null;
 }
 
-function makeTier(prefix, fallback) {
-  const get = (k) => env[`${prefix}${k}`];
-  const baseUrlRaw = get('BASE_URL') || (fallback && !get('PROVIDER') ? fallback.baseUrlRaw : '');
-  const provider = (get('PROVIDER') || (get('BASE_URL') ? 'openai' : fallback ? fallback.provider : 'anthropic')).toLowerCase();
-  const tier = {
-    provider,
-    baseUrlRaw,
-    baseUrl: (baseUrlRaw || (provider === 'openai' ? 'https://api.openai.com/v1' : '')).replace(/\/+$/, ''),
-    envKey: get('API_KEY') || (fallback && fallback.provider === provider ? fallback.envKey : '') ||
-      (provider === 'anthropic' ? env.ANTHROPIC_API_KEY : env.OPENAI_API_KEY) || '',
-    envModel: get('MODEL') || '',
-    price: parsePrice(get('PRICE_PER_MTOK')),
-    effort: (get('EFFORT') || '').toLowerCase(),
-    effortFromEnv: Boolean(get('EFFORT')),
-    runtimeModel: '',
-  };
-  tier.presets = provider === 'anthropic' ? ANTHROPIC_PRESETS : [];
-  return tier;
+const isClaude = (m) => /^claude-/i.test(String(m || '').trim());
+
+// la chiave: ANTHROPIC_API_KEY, oppure una vecchia LLM_*_API_KEY che sia di Anthropic
+function findApiKey() {
+  if (env.ANTHROPIC_API_KEY) return env.ANTHROPIC_API_KEY.trim();
+  for (const k of ['LLM_API_KEY', 'LLM_FAST_API_KEY', 'LLM_ALT_API_KEY']) {
+    if (/^sk-ant-/.test(env[k] || '')) return env[k].trim();
+  }
+  return '';
 }
 
-const strong = makeTier('LLM_', null);
-if (!strong.envModel) strong.envModel = env.ANTHROPIC_MODEL || (strong.provider === 'anthropic' ? 'claude-sonnet-5-5' : '');
-const fast = makeTier('LLM_FAST_', strong);
-if (!fast.envModel && fast.provider === 'anthropic') fast.envModel = 'claude-haiku-5-5';
+const auth = { key: findApiKey() };
+
+function makeTier(prefix, defModel, defEffort) {
+  const raw = env[`${prefix}MODEL`];
+  const envModel = isClaude(raw) ? raw.trim() : defModel;
+  const price = (isClaude(raw) && parsePrice(env[`${prefix}PRICE_PER_MTOK`])) || KNOWN_PRICES[envModel] || null;
+  return {
+    provider: 'anthropic',
+    baseUrl: '',
+    envModel,
+    price,
+    effort: (env[`${prefix}EFFORT`] || defEffort).toLowerCase(),
+    runtimeModel: '',
+    presets: ANTHROPIC_PRESETS,
+  };
+}
+
+function prettyModel(id) {
+  const parts = String(id || '').split(/[-_]/);
+  const out = [];
+  for (const p of parts) {
+    if (/^\d+$/.test(p) && out.length && /\d$/.test(out[out.length - 1])) out[out.length - 1] += `.${p}`;
+    else out.push(p.charAt(0).toUpperCase() + p.slice(1));
+  }
+  return out.join(' ');
+}
+
+const strong = makeTier('LLM_', 'claude-sonnet-5-5', 'medium');
+const fast = makeTier('LLM_FAST_', 'claude-haiku-5-5', 'low');
 // sforzo (quanto ragiona il modello): meno sforzo = meno token in uscita = meno costo
-if (!strong.effort && strong.provider === 'anthropic') strong.effort = 'medium';
-if (!fast.effort && fast.provider === 'anthropic') fast.effort = 'low';
 const tiers = { strong, fast };
+for (const t of Object.values(tiers)) {
+  Object.defineProperty(t, 'label', { enumerable: true, get() { return prettyModel(t.runtimeModel || t.envModel); } });
+}
 const routing = { mode: (env.ROUTING || 'auto').toLowerCase(), runtimeMode: '' };
 
 // ---------------------------------------------------------------------------
@@ -86,7 +106,6 @@ function loadSettings() {
 const saved = loadSettings();
 const settings = {
   allowLua: Boolean(saved.allowLua),
-  apiKey: saved.apiKey || '',
 };
 
 function saveSettings(patch) {
@@ -94,17 +113,38 @@ function saveSettings(patch) {
   fs.writeFileSync(settingsFile, JSON.stringify(settings, null, 2));
 }
 
+// Scrive (o sostituisce) ANTHROPIC_API_KEY nel .env; se il .env non c'è lo crea da .env.example.
+const envFile = path.join(root, '.env');
+function saveApiKey(key) {
+  let text = '';
+  if (fs.existsSync(envFile)) text = fs.readFileSync(envFile, 'utf8');
+  else if (fs.existsSync(path.join(root, '.env.example'))) text = fs.readFileSync(path.join(root, '.env.example'), 'utf8');
+  const line = `ANTHROPIC_API_KEY=${key}`;
+  const re = /^[ \t]*#?[ \t]*ANTHROPIC_API_KEY[ \t]*=.*$/m;
+  text = re.test(text) ? text.replace(re, line) : `${line}\n${text}`;
+  fs.writeFileSync(envFile, text);
+  env.ANTHROPIC_API_KEY = key;
+  auth.key = key;
+}
+
+// vecchie versioni salvavano la chiave in data/settings.json: la sposto nel .env
+if (saved.apiKey && !auth.key) {
+  try { saveApiKey(saved.apiKey); } catch (_) { /* resta da reinserire */ }
+}
+if (saved.apiKey || saved.expert) {
+  try { fs.writeFileSync(settingsFile, JSON.stringify(settings, null, 2)); } catch (_) { /* ignore */ }
+}
+
 function tierModel(t) {
   return t.runtimeModel || t.envModel;
 }
 
-function tierKey(t) {
-  return t.envKey || settings.apiKey || '';
+function tierKey() {
+  return auth.key;
 }
 
-function keyRequired(t) {
-  // Ollama / LM Studio in locale non vogliono chiavi
-  return !(t.provider === 'openai' && /localhost|127\.0\.0\.1/.test(t.baseUrl));
+function keyHint() {
+  return auth.key ? `${auth.key.slice(0, 7)}…${auth.key.slice(-4)}` : '';
 }
 
 function routingMode() {
@@ -123,6 +163,7 @@ module.exports = {
   stemsDir: path.join(dataDir, 'stems'),
   analyzerDir: path.join(root, 'analyzer'),
   tiers,
+  prettyModel,
   routing,
   routingMode,
   separator,
@@ -130,5 +171,6 @@ module.exports = {
   saveSettings,
   tierModel,
   tierKey,
-  keyRequired,
+  keyHint,
+  saveApiKey,
 };

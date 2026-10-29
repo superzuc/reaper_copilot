@@ -65,6 +65,8 @@ export function toolLabel(name, input = {}) {
     case 'get_envelope': return `Legge automazione ${input.fx ? `${input.fx} ${input.param}` : 'volume'} · ${t(input.track)}`;
     case 'set_envelope': return `Automazione ${input.fx ? `${input.fx} · ${input.param}` : 'volume'} · ${t(input.track)}${input.points ? ` (${input.points.length} punti)` : ''}`;
     case 'setup_sidechain': return `Sidechain ${t(input.source)} → ${t(input.target)}`;
+    case 'restore_baseline': return 'Ripristina il mix originale';
+    case 'set_baseline': return 'Salva lo stato attuale come originale';
     case 'update_notes': return input.scope === 'user' ? 'Aggiorna le tue preferenze' : 'Aggiorna le note del progetto';
     case 'undo': return 'Annulla ultima azione';
     case 'run_action': return `Esegue azione ${input.id}`;
@@ -87,6 +89,8 @@ export const TOOL_GLYPH = {
   setup_sidechain: '⇢',
   split_item: '✂',
   edit_item: '▭',
+  restore_baseline: '↺',
+  set_baseline: '⚑',
   update_notes: '✎',
   run_lua: '{}',
 };

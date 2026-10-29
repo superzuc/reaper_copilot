@@ -46,7 +46,6 @@ function ModelField({ label, hint, tier, onSave }) {
     <div>
       <span className="mb-1 flex justify-between text-[#8b8f98]">
         <span>{label} <span className="text-[#6d717a]">· {hint}</span></span>
-        <span className="font-mono text-[11px] text-[#6d717a]">{tier.provider === 'anthropic' ? 'Anthropic' : (tier.baseUrl || '').replace(/^https?:\/\//, '')}</span>
       </span>
       <input
         list={id}
@@ -71,7 +70,6 @@ const ROUTING_OPTIONS = [
 ];
 
 function Settings({ status, onSaved }) {
-  const [key, setKey] = useState('');
   const save = async (patch) => {
     await fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) });
     onSaved();
@@ -101,28 +99,16 @@ function Settings({ status, onSaved }) {
       <ModelField label="Veloce" hint="comandi semplici" tier={tiers.fast} onSave={(v) => save({ fastModel: v })} />
       <ModelField label="Esperto" hint="mix e analisi" tier={tiers.strong} onSave={(v) => save({ strongModel: v })} />
       <span className="-mt-1 block text-[11.5px] text-[#6d717a]">I modelli scelti qui valgono fino al riavvio; i default sono nel .env.</span>
-      {!status.apiKeyFromEnv && (
-        <div>
-          <span className="mb-1 block text-[#8b8f98]">API key {status.hasApiKey && <span className="text-[#5fd38d]">· impostata</span>}</span>
-          <div className="flex gap-2">
-            <input
-              type="password"
-              value={key}
-              placeholder={status.hasApiKey ? '••••••••  (sostituisci)' : 'meglio LLM_API_KEY nel .env'}
-              onChange={(e) => setKey(e.target.value)}
-              className="min-w-0 flex-1 rounded-md border border-[#33363d] bg-[#25272c] px-2 py-1.5 outline-none focus:border-[#e8a33d]"
-            />
-            <button
-              type="button"
-              disabled={!key.trim()}
-              onClick={() => { save({ apiKey: key }); setKey(''); }}
-              className="rounded-md bg-[#e8a33d] px-3 font-medium text-[#1a1407] disabled:opacity-40"
-            >
-              Salva
-            </button>
-          </div>
-        </div>
-      )}
+      <div>
+        <span className="mb-1 flex justify-between text-[#8b8f98]">
+          <span>Chiave Anthropic</span>
+          <span className="font-mono text-[11px] text-[#6d717a]">{status.keyHint}</span>
+        </span>
+        <KeyInput compact onSaved={onSaved} />
+        <span className="mt-1 block text-[11.5px] text-[#6d717a]">
+          Consumi e limite di spesa: <a href="https://platform.claude.com/settings/billing" target="_blank" rel="noreferrer" className="text-[#e8a33d] hover:underline">console Anthropic</a>
+        </span>
+      </div>
       {separator && (
         <div className="flex items-center gap-2 text-[12px]">
           <Dot on={separator.ready} warn={separator.mode !== 'off'} />
@@ -383,6 +369,101 @@ function AssistantTurn({ turn, running }) {
   );
 }
 
+
+/* ------------------------------------------------------------------ */
+/* Chiave API (primo avvio)                                           */
+/* ------------------------------------------------------------------ */
+function KeyInput({ compact, onSaved }) {
+  const [key, setKey] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const submit = async () => {
+    if (!key.trim() || busy) return;
+    setBusy(true);
+    setError('');
+    try {
+      const r = await fetch('/api/setup/key', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key: key.trim() }) });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok || !data.ok) setError(data.error || `Errore ${r.status}`);
+      else { setKey(''); onSaved(); }
+    } catch (_) {
+      setError('Server non raggiungibile: avvia "npm start".');
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div>
+      <div className="flex gap-2">
+        <input
+          type="password"
+          value={key}
+          autoFocus={!compact}
+          placeholder={compact ? 'nuova chiave (sostituisce)' : 'sk-ant-…'}
+          onChange={(e) => setKey(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') submit(); }}
+          className={`min-w-0 flex-1 rounded-md border border-[#33363d] bg-[#25272c] px-2 font-mono outline-none focus:border-[#e8a33d] ${compact ? 'py-1.5 text-[12px]' : 'py-2 text-[13px]'}`}
+        />
+        <button
+          type="button"
+          disabled={!key.trim() || busy}
+          onClick={submit}
+          className="rounded-md bg-[#e8a33d] px-3 text-[12.5px] font-medium text-[#1a1407] disabled:opacity-40"
+        >
+          {busy ? 'Verifico…' : compact ? 'Cambia' : 'Verifica e salva'}
+        </button>
+      </div>
+      {error && <p className="mt-1.5 text-[12px] leading-snug text-[#f0a09b]">{error}</p>}
+    </div>
+  );
+}
+
+const COSTS = [
+  ['Comando semplice ("abbassa la batteria")', 'meno di 0,01 $'],
+  ['Ritocco di suono', '0,04–0,10 $'],
+  ['Mix completo con reference', '0,20–0,30 $'],
+];
+
+function Welcome({ onSaved }) {
+  const link = (href, text) => <a href={href} target="_blank" rel="noreferrer" className="text-[#e8a33d] hover:underline">{text}</a>;
+  return (
+    <main className="flex-1 overflow-y-auto px-4 py-5 text-[13px] leading-relaxed text-[#c9ccd2]">
+      <p className="mb-1 text-[16px] font-semibold text-[#f1f2f4]">Benvenuto in REAPER Copilot</p>
+      <p className="mb-4 text-[#9a9ea7]">
+        Il copilot usa Claude di Anthropic: Sonnet 5.5 per mix e analisi, Haiku 5.5 per i comandi veloci.
+        Serve una tua chiave API. Paghi solo quello che usi, direttamente ad Anthropic.
+      </p>
+
+      <p className="mb-1.5 font-medium text-[#f1f2f4]">Come ottenere la chiave</p>
+      <ol className="mb-4 list-decimal space-y-1 pl-5">
+        <li>Accedi o registrati su {link('https://platform.claude.com/', 'platform.claude.com')}.</li>
+        <li>In {link('https://platform.claude.com/settings/billing', 'Billing')} aggiungi del credito: 5 $ bastano per iniziare.</li>
+        <li>In {link('https://platform.claude.com/settings/keys', 'API keys')} clicca <span className="text-[#f1f2f4]">Create key</span> e copiala subito (inizia con <code className="text-[#e8a33d]">sk-ant-</code>, la vedi una volta sola).</li>
+        <li>Incollala qui sotto.</li>
+      </ol>
+
+      <KeyInput onSaved={onSaved} />
+      <p className="mt-1.5 mb-5 text-[11.5px] text-[#6d717a]">
+        La chiave viene controllata con una richiesta minima e salvata nel file <code>.env</code> di questo PC. Va solo ad Anthropic, nessun altro la vede.
+      </p>
+
+      <p className="mb-1.5 font-medium text-[#f1f2f4]">Quanto costa, più o meno</p>
+      <div className="mb-2 overflow-hidden rounded-md border border-[#2c2f35]">
+        {COSTS.map(([what, cost]) => (
+          <div key={what} className="flex justify-between gap-3 border-b border-[#2c2f35] px-2.5 py-1.5 last:border-b-0">
+            <span>{what}</span>
+            <span className="whitespace-nowrap font-mono text-[12px] text-[#f0c46b]">{cost}</span>
+          </div>
+        ))}
+      </div>
+      <p className="text-[12px] text-[#8b8f98]">
+        Con 5 $ fai circa 20 mix completi, oppure centinaia di comandi semplici. Il costo di ogni risposta lo vedi in chat.
+        In console puoi impostare un limite di spesa mensile.
+      </p>
+    </main>
+  );
+}
+
 /* ------------------------------------------------------------------ */
 /* App                                                                */
 /* ------------------------------------------------------------------ */
@@ -511,6 +592,7 @@ export default function App() {
   };
 
   const reaperOk = status && status.reaper && status.reaper.connected;
+  const needsKey = Boolean(status && !status.offline && status.tiers && !status.hasApiKey);
   const modelLabel = status && status.tiers
     ? (status.routing === 'auto' ? 'auto' : String(status.tiers[status.routing].model || '').replace(/^claude-/, '').replace(/^.*\//, ''))
     : '';
@@ -537,11 +619,6 @@ export default function App() {
 
       {showSettings && <Settings status={status} onSaved={refreshStatus} />}
 
-      {status && !status.offline && !status.hasApiKey && !showSettings && (
-        <button type="button" onClick={() => setShowSettings(true)} className="border-b border-[#4a3a1c] bg-[#2a2216] px-3 py-2 text-left text-[12.5px] text-[#f0c46b]">
-          Manca la API key: mettila in LLM_API_KEY nel file .env (o qui) →
-        </button>
-      )}
       {status && !status.offline && !reaperOk && (
         <div className="border-b border-[#2c2f35] bg-[#1f1a1a] px-3 py-2 text-[12px] leading-snug text-[#c9a8a5]">
           In REAPER: <span className="text-[#e6e7ea]">Actions → Show action list → New action → Load ReaScript</span> e avvia <code className="text-[#e8a33d]">reaper/reaper_copilot_bridge.lua</code>.
@@ -551,6 +628,7 @@ export default function App() {
         <div className="border-b border-[#2c2f35] bg-[#1f1a1a] px-3 py-2 text-[12px] text-[#c9a8a5]">Server non raggiungibile: avvia <code>npm start</code> nella cartella del progetto.</div>
       )}
 
+      {needsKey ? <Welcome onSaved={refreshStatus} /> : (<>
       <References />
       <Memory version={memoryVersion} />
 
@@ -607,6 +685,7 @@ export default function App() {
           )}
         </div>
       </footer>
+      </>)}
     </div>
   );
 }
